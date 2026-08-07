@@ -1493,6 +1493,61 @@ def _normalized_inference_axes(job: Dict[str, Any]) -> Tuple[Optional[str], Opti
     )
 
 
+# Minimum cadence (seconds) for a *recurring* job created through the normal
+# path. Every-minute / sub-2-minute recurring crons are almost always a mistake
+# — typically an agent that meant "once in N minutes" emitting "* * * * *" or
+# "every 1m" — and a runaway every-minute job burns compute forever. Genuine
+# high-frequency infrastructure watchdogs must opt in explicitly via
+# create_job(..., allow_high_frequency=True). One-shot schedules are never
+# affected (they fire once). See the voice-line "one-shot became forever" bug,
+# 2026-06-26.
+MIN_RECURRING_CADENCE_SECONDS = 120
+
+
+def _effective_cadence_seconds(parsed_schedule: Dict[str, Any]) -> Optional[float]:
+    """Best-effort seconds between two consecutive fires of a *recurring* schedule.
+
+    Returns None for one-shot schedules, or when the cadence genuinely can't be
+    computed (e.g. ``croniter`` unavailable) — in which case the caller fails
+    OPEN and does not block job creation. Robust across every-minute crons,
+    step values (``*/2``), ranges, and 6-field (seconds) crons because it asks
+    the real scheduler for the gap between the next two fire times.
+    """
+    kind = parsed_schedule.get("kind")
+    if kind == "interval":
+        try:
+            return float(parsed_schedule.get("minutes") or 0) * 60.0
+        except (TypeError, ValueError):
+            return None
+    if kind == "cron":
+        expr = parsed_schedule.get("expr")
+        if not expr:
+            return None
+        try:
+            from croniter import croniter
+            base = _hermes_now()
+            window = 86400.0  # Average cadence over the next 24h, not the gap
+            # between the next two fires — so a schedule with one adjacent-minute
+            # pair (e.g. '0,1 0 * * *', which fires only twice a day) is NOT
+            # mistaken for an every-minute cron.
+            horizon = base + timedelta(seconds=window)
+            itr = croniter(expr, base)
+            count = 0
+            cap = 5000  # bounds the pathological 6-field (per-second) case while
+            #             still counting a true every-minute cron (1440/day) exactly
+            while count < cap:
+                nxt = itr.get_next(datetime)
+                if nxt >= horizon:
+                    break
+                count += 1
+            if count <= 0:
+                return None  # fires less than daily → far above any floor; fail open
+            return window / count
+        except Exception:
+            return None
+    return None
+
+
 def create_job(
     prompt: Optional[str],
     schedule: str,
@@ -1511,6 +1566,7 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    allow_high_frequency: bool = False,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1555,9 +1611,20 @@ def create_job(
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
                 watchdogs and periodic alerts that don't need LLM reasoning.
+        allow_high_frequency: Opt-in escape hatch for genuine infrastructure
+                watchdogs that must run more often than every
+                ``MIN_RECURRING_CADENCE_SECONDS`` (default 120s). When False
+                (the default) a recurring schedule that fires below that floor
+                is rejected with a ValueError, so an agent that meant "remind me
+                once in a minute" can't accidentally create an every-minute
+                forever-cron. One-shot schedules are never affected.
 
     Returns:
         The created job dict
+
+    Raises:
+        ValueError: if a recurring schedule fires below the minimum cadence and
+            ``allow_high_frequency`` is not set.
     """
     parsed_schedule = parse_schedule(schedule)
 
@@ -1568,6 +1635,23 @@ def create_job(
     # Auto-set repeat=1 for one-shot schedules if not specified
     if parsed_schedule["kind"] == "once" and repeat is None:
         repeat = 1
+
+    # Frequency floor: reject pathologically frequent *recurring* schedules
+    # unless the caller explicitly opts in. This is what stops an agent that
+    # meant "remind me once in a minute" but emitted "* * * * *" / "every 1m"
+    # from creating a job that fires every minute forever. One-shot schedules
+    # ('1m', ISO timestamps) are unaffected — they fire exactly once.
+    if not allow_high_frequency and parsed_schedule.get("kind") in ("interval", "cron"):
+        cadence = _effective_cadence_seconds(parsed_schedule)
+        if cadence is not None and cadence < MIN_RECURRING_CADENCE_SECONDS:
+            raise ValueError(
+                f"Recurring schedule '{schedule}' fires every ~{int(cadence)}s, below the "
+                f"{MIN_RECURRING_CADENCE_SECONDS}s minimum for a recurring job. "
+                "If you meant a one-time reminder, use a one-shot schedule instead: a bare "
+                "duration like '1m' or '5m', or an ISO timestamp like '2026-06-26T17:00:00', "
+                "fires exactly once. For a genuine infrastructure watchdog that must run this "
+                "often, call create_job(..., allow_high_frequency=True)."
+            )
 
     # Default delivery to origin if available, otherwise local
     if deliver is None:
@@ -1754,8 +1838,17 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
     return jobs
 
 
-def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Update a job by ID, refreshing derived schedule fields when needed."""
+def update_job(job_id: str, updates: Dict[str, Any],
+               allow_high_frequency: bool = False) -> Optional[Dict[str, Any]]:
+    """Update a job by ID, refreshing derived schedule fields when needed.
+
+    The recurring-cadence frequency floor (see ``create_job`` /
+    ``MIN_RECURRING_CADENCE_SECONDS``) is re-applied whenever the update
+    changes the schedule, so an every-minute schedule cannot be slipped in via
+    ``update`` after a compliant ``create``. Pass ``allow_high_frequency=True``
+    for genuine infrastructure watchdogs. Updates that don't touch the schedule
+    (pause/resume/rename/etc.) are never affected.
+    """
     # Block mutation of immutable fields. ``id`` in particular is a filesystem
     # path component under OUTPUT_DIR — letting an update change it leaks
     # path-escape values into output writes/deletes.
@@ -1800,6 +1893,21 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 if isinstance(updated_schedule, str):
                     updated_schedule = parse_schedule(updated_schedule)
                     updated["schedule"] = updated_schedule
+                # Re-apply the frequency floor on schedule change so an
+                # every-minute schedule can't sneak in via update after a
+                # compliant create. Mirrors create_job(). Raises before any
+                # save, so the on-disk job is left untouched on rejection.
+                if (not allow_high_frequency and isinstance(updated_schedule, dict)
+                        and updated_schedule.get("kind") in ("interval", "cron")):
+                    _cadence = _effective_cadence_seconds(updated_schedule)
+                    if _cadence is not None and _cadence < MIN_RECURRING_CADENCE_SECONDS:
+                        raise ValueError(
+                            f"Recurring schedule fires every ~{int(_cadence)}s, below the "
+                            f"{MIN_RECURRING_CADENCE_SECONDS}s minimum for a recurring job. "
+                            "Use a one-shot schedule for a one-time reminder, a cadence >= 2m "
+                            "for a monitor, or update_job(..., allow_high_frequency=True) for a "
+                            "genuine infrastructure watchdog."
+                        )
                 updated["schedule_display"] = updates.get(
                     "schedule_display",
                     updated_schedule.get("display", updated.get("schedule_display")),

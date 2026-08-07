@@ -852,6 +852,58 @@ class TestSharedBoardPaths:
                 continue
             assert key not in env
 
+    def test_dispatcher_spawn_strips_gateway_approval_env(self, tmp_path, monkeypatch):
+        # Gateway-embedded dispatchers set these variables for the live chat
+        # approval flow. Detached kanban workers must not inherit them, or
+        # every flagged worker terminal command asks the original chat again.
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        self._set_home(monkeypatch, tmp_path, default_home)
+        monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        monkeypatch.setenv("HERMES_SESSION_KEY", "telegram:123")
+        monkeypatch.setenv("HERMES_SPINNER_PAUSE", "1")
+
+        captured = {}
+
+        class _FakePopen:
+            def __init__(self, cmd, **kwargs):
+                captured["env"] = kwargs.get("env", {})
+                self.pid = 4242
+
+        monkeypatch.setattr("subprocess.Popen", _FakePopen)
+
+        task = kb.Task(
+            id="t_dispatch_no_approval_env",
+            title="x",
+            body=None,
+            assignee="coder",
+            status="ready",
+            priority=0,
+            created_by=None,
+            created_at=0,
+            started_at=None,
+            completed_at=None,
+            workspace_kind="scratch",
+            workspace_path=None,
+            claim_lock=None,
+            claim_expires=None,
+            tenant=None,
+        )
+        kb._default_spawn(task, str(tmp_path / "ws"))
+
+        env = captured["env"]
+        for key in (
+            "HERMES_EXEC_ASK",
+            "HERMES_GATEWAY_SESSION",
+            "HERMES_INTERACTIVE",
+            "HERMES_SESSION_KEY",
+            "HERMES_SPINNER_PAUSE",
+        ):
+            assert key not in env
+        assert env["HERMES_KANBAN_TASK"] == "t_dispatch_no_approval_env"
+
 
 # ---------------------------------------------------------------------------
 # latest_summary / latest_summaries — surface task_runs.summary handoffs

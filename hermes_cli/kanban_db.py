@@ -8991,9 +8991,17 @@ def _default_spawn(
     env = dict(os.environ)
     # The dispatcher is detached from every conversation. Its worker must never
     # inherit routing mirrored by a previous gateway turn, even before the first
-    # session binds ContextVars in this process.
+    # session binds ContextVars in this process.  _VAR_MAP covers the
+    # session-scoped mirror; the explicit flags cover process-wide approval and
+    # presentation state that is intentionally outside session_context.
     from gateway.session_context import _VAR_MAP
-    for key in _VAR_MAP:
+
+    for key in set(_VAR_MAP) | {
+        "HERMES_EXEC_ASK",
+        "HERMES_GATEWAY_SESSION",
+        "HERMES_INTERACTIVE",
+        "HERMES_SPINNER_PAUSE",
+    }:
         env.pop(key, None)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml

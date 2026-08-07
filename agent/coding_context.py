@@ -862,6 +862,33 @@ def project_facts_for(cwd: Optional[str | Path] = None) -> Optional[dict[str, An
     }
 
 
+def facts_are_verifiable(facts: Optional[dict[str, Any]]) -> bool:
+    """True when project facts expose something code-verifiable.
+
+    A context-only root (only AGENTS.md/CLAUDE.md/.cursorrules, no manifest, no
+    detected verify command, no .git) is NOT verifiable: editing a pure-prose doc
+    there must not trip the verify-on-stop nudge. A genuine code workspace (any
+    manifest — even an empty package.json — any detected verify command, or a git
+    repo) IS verifiable.
+
+    SEPARATE predicate: ``project_facts_for``'s body and return shape are
+    unchanged, so every existing consumer keeps receiving the identical dict.
+    Only the verify-on-stop nudge site opts into this stricter gate.
+    """
+    if not facts:
+        return False
+    if facts.get("manifests") or facts.get("verifyCommands"):
+        return True
+    # A git-rooted workspace is code even when manifests/verify weren't sniffed.
+    root = facts.get("root")
+    if root:
+        try:
+            return (Path(root) / ".git").exists()
+        except OSError:
+            return False
+    return False
+
+
 def build_coding_workspace_block(cwd: Optional[str | Path] = None) -> str:
     """Workspace snapshot for the system prompt (empty outside a workspace).
 

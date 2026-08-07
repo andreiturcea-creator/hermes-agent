@@ -3021,11 +3021,36 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
             return False
 
     # Seed from the custom_providers config entry's api_key field
+    #
+    # (local-patch: venice-pool-seed-guard) Resolve the custom-provider secret
+    # robustly so an UNEXPANDED "${VAR}" template can never be seeded as a bearer
+    # token. hermes_cli.config._expand_env_vars keeps the literal (e.g.
+    # "${VENICE_API_KEY}") whenever the var is absent from os.environ at the moment
+    # load_config first builds+caches config -- a cron/worker thread with a stripped
+    # env, or load_config running before env_loader.load_hermes_dotenv. A truthy
+    # 17-char literal would otherwise be seeded and sent verbatim to the provider
+    # -> HTTP 401 "Authentication failed", then persisted + marked exhausted. When
+    # the expanded value is still a template (or empty), fall back to reading
+    # key_env straight from ~/.hermes/.env (export-stripped, independent of
+    # os.environ / profile scope) via get_env_value_prefer_dotenv.
     cp_config = _get_custom_provider_config(pool_key)
     if cp_config:
         api_key = str(cp_config.get("api_key") or "").strip()
         base_url = str(cp_config.get("base_url") or "").strip().rstrip("/")
         name = str(cp_config.get("name") or "").strip()
+        if api_key.startswith("${") and api_key.endswith("}"):
+            api_key = ""
+        if not api_key:
+            key_env = str(cp_config.get("key_env") or "").strip()
+            if key_env:
+                try:
+                    from hermes_cli.config import get_env_value_prefer_dotenv
+
+                    resolved = str(get_env_value_prefer_dotenv(key_env) or "").strip()
+                except Exception:
+                    resolved = ""
+                if resolved and not (resolved.startswith("${") and resolved.endswith("}")):
+                    api_key = resolved
         if api_key:
             source = f"config:{name}"
             if not _is_suppressed(pool_key, source):

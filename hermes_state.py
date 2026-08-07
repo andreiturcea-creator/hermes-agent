@@ -150,6 +150,14 @@ def _scrub_surrogates(value: Any) -> Any:
     return _sanitize_surrogates(value) if isinstance(value, str) else value
 
 
+def _normalize_platform_message_id(value: Any) -> Optional[str]:
+    """Return a stable external message id, or ``None`` for an empty value."""
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
 def workspace_key(row: Dict[str, Any]) -> Optional[str]:
     """A session's workspace grouping key: its git repo root when known, else
     its cwd.
@@ -6652,6 +6660,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         from every outgoing payload anyway, so the scrubbed form IS the
         wire bytes).
         """
+        platform_message_id = _normalize_platform_message_id(platform_message_id)
+
         # Display metadata is presentation-only and never changes the model
         # context role/content replayed to providers.
         display_metadata_json = self._encode_display_metadata(display_metadata)
@@ -6700,6 +6710,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self._check_transcript_write_guards(
                 conn, session_id, compression_lock_holder
             )
+            if platform_message_id is not None:
+                existing = conn.execute(
+                    "SELECT id FROM messages "
+                    "WHERE session_id = ? AND platform_message_id = ? LIMIT 1",
+                    (session_id, platform_message_id),
+                ).fetchone()
+                if existing is not None:
+                    return int(existing[0])
             cursor = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
@@ -6806,6 +6824,28 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self._check_transcript_write_guards(
                 conn, session_id, compression_lock_holder
             )
+            platform_ids = {
+                normalized
+                for msg in messages
+                if (
+                    normalized := _normalize_platform_message_id(
+                        msg.get("platform_message_id") or msg.get("message_id")
+                    )
+                )
+                is not None
+            }
+            if platform_ids:
+                placeholders = ",".join("?" for _ in platform_ids)
+                existing = conn.execute(
+                    "SELECT 1 FROM messages WHERE session_id = ? "
+                    f"AND platform_message_id IN ({placeholders}) LIMIT 1",
+                    (session_id, *sorted(platform_ids)),
+                ).fetchone()
+                if existing is not None:
+                    # This is a replay of a previously committed inbound turn.
+                    # Skip the entire atomic batch, not merely the user row,
+                    # otherwise its assistant/tool tail would be duplicated.
+                    return 0
             inserted, tool_calls_total = self._insert_message_rows(
                 conn, session_id, messages
             )
@@ -7123,7 +7163,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             tool_calls_json = json.dumps(tool_calls) if tool_calls else None
             # Accept either `platform_message_id` (new explicit name) or
             # `message_id` (yuanbao's existing convention on message dicts).
-            platform_msg_id = (
+            platform_msg_id = _normalize_platform_message_id(
                 msg.get("platform_message_id") or msg.get("message_id")
             )
 
@@ -8219,6 +8259,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         to skip re-persisting a user message that was already saved on a
         prior retry of the same inbound platform message.
         """
+        platform_message_id = _normalize_platform_message_id(platform_message_id)
+        if platform_message_id is None:
+            return False
         with self._lock:
             cursor = self._conn.execute(
                 "SELECT 1 FROM messages "

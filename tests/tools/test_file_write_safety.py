@@ -213,6 +213,82 @@ class TestCheckSensitivePathMacOSBypass:
         assert _check_sensitive_path("/tmp/safe_file.txt") is None
 
 
+class TestCheckSensitivePathReturnContract:
+    """_check_sensitive_path returns a structured 2-tuple on denial
+    (error_code='sensitive_path_denied' for path-safety, None for the config
+    refusal) and a BARE None on the safe path."""
+
+    def test_check_sensitive_path_returns_tuple(self):
+        from tools.file_tools import _check_sensitive_path
+
+        # Path-safety branch -> ('...', 'sensitive_path_denied')
+        denied = _check_sensitive_path("/private/var/db/x")
+        assert isinstance(denied, tuple)
+        assert denied[1] == "sensitive_path_denied"
+
+        # Config-refusal branch -> ('...', None)  (genuine target, not a helper)
+        import tools.file_tools as ft
+        cfg = "/home/u/.hermes/config.yaml"
+        monkey_resolved = cfg
+
+        orig = ft._get_hermes_config_resolved
+        ft._get_hermes_config_resolved = lambda: monkey_resolved
+        try:
+            refused = _check_sensitive_path(cfg)
+        finally:
+            ft._get_hermes_config_resolved = orig
+        assert isinstance(refused, tuple)
+        assert refused[1] is None
+        assert "Hermes config" in refused[0]
+
+        # Safe path -> bare None (NOT (None, None)).
+        assert _check_sensitive_path("/tmp/safe.txt") is None
+
+
+class TestSafeWriteEndToEnd:
+    """Regression guard: the SAFE path returns a bare None, so the callers
+    MUST guard-before-unpack. If a future reviser reintroduces an
+    unconditional tuple unpack, the bare-None safe path raises TypeError and
+    these end-to-end writes fail.
+
+    NOTE: pytest's ``tmp_path`` lives under ``/private/var/folders`` on macOS,
+    which IS a sensitive prefix — so a safe-path write must target a genuinely
+    non-sensitive root. ``/tmp`` (→ ``/private/tmp``) is allowed; we mkdtemp
+    there so this exercises the SAFE branch, not the denial branch."""
+
+    @pytest.fixture
+    def safe_dir(self, monkeypatch):
+        import tempfile, shutil
+        monkeypatch.delenv("HERMES_WRITE_SAFE_ROOT", raising=False)
+        d = tempfile.mkdtemp(dir="/tmp", prefix="hermes-safewrite-")
+        try:
+            yield Path(d)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_safe_write_through_write_file_tool_succeeds(self, safe_dir: Path):
+        from tools.file_tools import write_file_tool
+
+        target = safe_dir / "safe.txt"
+        raw = write_file_tool(str(target), "hello world\n")
+        import json as _json
+        result = _json.loads(raw)
+        assert result.get("error") is None, result
+        assert target.read_text() == "hello world\n"
+
+    def test_safe_patch_through_patch_tool_succeeds(self, safe_dir: Path):
+        from tools.file_tools import patch_tool
+
+        target = safe_dir / "edit.py"
+        target.write_text("a = 1\nb = 2\nc = 3\n")
+        raw = patch_tool(mode="replace", path=str(target),
+                         old_string="b = 2", new_string="b = 22")
+        import json as _json
+        result = _json.loads(raw)
+        assert result.get("error") is None, result
+        assert target.read_text() == "a = 1\nb = 22\nc = 3\n"
+
+
 class TestAtomicWrite:
     """write_file / patch land via a temp-file + atomic rename.
 

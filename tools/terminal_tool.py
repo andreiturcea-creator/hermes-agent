@@ -2676,7 +2676,32 @@ def terminal_tool(
             )
 
         # The session key is already computed above the gateway guard.
+        from tools.docx_safety_guard import command_mentions_docx
+
+        if command_mentions_docx(command) and env_type != "local":
+            return json.dumps({
+                "output": "",
+                "exit_code": 65,
+                "error": (
+                    "DOCX SAFETY BLOCK: .docx commands require the local "
+                    "foreground backend so Hermes can snapshot and validate "
+                    "the exact host files."
+                ),
+                "status": "blocked",
+            }, ensure_ascii=False)
+
         if background:
+            if command_mentions_docx(command):
+                return json.dumps({
+                    "output": "",
+                    "exit_code": 65,
+                    "error": (
+                        "DOCX SAFETY BLOCK: .docx commands must run in the "
+                        "foreground so Hermes can validate and restore the "
+                        "output before returning."
+                    ),
+                    "status": "blocked",
+                }, ensure_ascii=False)
             # Spawn a tracked background process via the process registry.
             # For local backends: uses subprocess.Popen with output buffering.
             # For non-local backends: runs inside the sandbox via env.execute().
@@ -2929,6 +2954,8 @@ def terminal_tool(
             retry_count = 0
             result = None
             command_cwd = None
+            docx_guard_session = None
+            docx_guard_initialized = False
 
             # Clean interrupt slate for an approved command, ONCE before the
             # retry loop: drop a stale bit that landed on this thread during the
@@ -2947,6 +2974,25 @@ def terminal_tool(
                         default_cwd=cwd,
                         session_key=session_key,
                     )
+                    if not docx_guard_initialized:
+                        try:
+                            from tools.docx_safety_guard import prepare_terminal_guard
+
+                            docx_guard_session = prepare_terminal_guard(
+                                command, command_cwd
+                            )
+                        except Exception as guard_error:
+                            return json.dumps({
+                                "output": "",
+                                "exit_code": 65,
+                                "error": (
+                                    "DOCX SAFETY PREFLIGHT BLOCK: command was not "
+                                    f"executed: {type(guard_error).__name__}: "
+                                    f"{guard_error}"
+                                ),
+                                "status": "blocked",
+                            }, ensure_ascii=False)
+                        docx_guard_initialized = True
                     execute_kwargs = {
                         "timeout": effective_timeout,
                         "cwd": command_cwd,
@@ -2959,6 +3005,32 @@ def terminal_tool(
                     }
                     result = env.execute(command, **execute_kwargs)
                 except Exception as e:
+                    if docx_guard_session is not None:
+                        from tools.docx_safety_guard import (
+                            finalize_terminal_guard,
+                            format_guard_error,
+                        )
+
+                        guard_report = finalize_terminal_guard(docx_guard_session)
+                        docx_guard_session = None
+                        if not guard_report.ok:
+                            return json.dumps({
+                                "output": format_guard_error(guard_report),
+                                "exit_code": 65,
+                                "error": (
+                                    "DOCX output failed validation and was "
+                                    "restored or quarantined"
+                                ),
+                                "status": "blocked",
+                            }, ensure_ascii=False)
+                        return json.dumps({
+                            "output": "",
+                            "exit_code": 124 if "timeout" in str(e).lower() else -1,
+                            "error": (
+                                "DOCX command execution failed safely: "
+                                f"{type(e).__name__}: {e}"
+                            ),
+                        }, ensure_ascii=False)
                     error_str = str(e).lower()
                     if "timeout" in error_str:
                         return json.dumps({
@@ -3004,6 +3076,17 @@ def terminal_tool(
             # Extract output
             output = result.get("output", "")
             returncode = result.get("returncode", 0)
+            if docx_guard_session is not None:
+                from tools.docx_safety_guard import (
+                    finalize_terminal_guard,
+                    format_guard_error,
+                )
+
+                guard_report = finalize_terminal_guard(docx_guard_session)
+                if not guard_report.ok:
+                    guard_message = format_guard_error(guard_report)
+                    output = (output.rstrip() + "\n\n" + guard_message).strip()
+                    returncode = 65
             # Spill metadata from the bounded collector: present only when
             # output overflowed the capture window (see _wait_for_process).
             spill_total_chars = result.get("output_total_chars")

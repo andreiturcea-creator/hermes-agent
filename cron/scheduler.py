@@ -288,7 +288,15 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_runs, claim_dispatch, heartbeat_run_claim
+from cron.jobs import (
+    advance_next_runs,
+    claim_dispatch,
+    get_due_jobs,
+    heartbeat_run_claim,
+    mark_job_run,
+    pause_job,
+    save_job_output,
+)
 from cron.executions import create_execution, finish_execution, mark_execution_running
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
@@ -323,6 +331,90 @@ def _is_cron_silence_response(text: str) -> bool:
     from gateway.response_filters import is_autonomous_silence_response
 
     return is_autonomous_silence_response(text)
+
+
+# Sentinel: when a RECURRING cron agent decides its task is permanently
+# complete (the thing it watched for happened / the goal is achieved and there
+# is nothing left for any future run), it ends its response with this marker.
+# The runner delivers the final message (marker stripped) and then STOPS the
+# job — a best-effort stop for monitor crons that otherwise run forever (the
+# agent must emit the marker; the deterministic backstop remains repeat.times).
+# Unlike [SILENT] (suppress this delivery, keep the job alive), [DONE] ends it.
+DONE_MARKER = "[DONE]"
+# Match the marker only as a TRAILING token (optionally on its own line, and
+# tolerating trailing punctuation like '[DONE].' / '[DONE]!') so a monitor that
+# merely MENTIONS "[DONE]" mid-report (e.g. a status list) doesn't accidentally
+# stop itself. Mirrors the guidance: "end your response with [DONE] on its own line".
+_DONE_TAIL_RE = re.compile(r"\s*" + re.escape(DONE_MARKER) + r"[\s.!]*\Z", re.IGNORECASE)
+
+
+def _is_recurring_schedule(job: dict) -> bool:
+    """True if the job recurs (interval/cron) rather than firing once.
+
+    Robust to the schedule being stored either as a parsed dict (the normal
+    persisted form) or as a raw string (e.g. '*/5 * * * *' / 'every 10m' /
+    a bare duration / ISO timestamp), which some call paths and tests pass.
+    """
+    sched = job.get("schedule")
+    if isinstance(sched, dict):
+        return sched.get("kind") in ("interval", "cron")
+    if isinstance(sched, str) and sched.strip():
+        try:
+            from cron.jobs import parse_schedule
+            return parse_schedule(sched).get("kind") in ("interval", "cron")
+        except Exception:
+            return False
+    return False
+
+
+def _cron_execution_hint(job: dict) -> str:
+    """Build the cron-execution guidance prepended to a job's prompt.
+
+    Recurring (interval/cron) jobs additionally learn the ``[DONE]`` completion
+    protocol so they can stop themselves when their task is finished. One-shot
+    jobs don't need it (they already fire once), so it is omitted for them.
+    """
+    completion = ""
+    if _is_recurring_schedule(job):
+        completion = (
+            " COMPLETION: This is a recurring job. If the task you were created "
+            "for is now permanently complete and nothing remains for any future "
+            "run (e.g. the thing you were watching for has happened, or the goal "
+            "is achieved), end your response with \"[DONE]\" on its own line — the "
+            "system delivers your final message and then STOPS this job so it does "
+            "not keep running forever. Use [DONE] only when truly finished; for a "
+            "routine run with nothing to report use [SILENT] instead (that keeps "
+            "the job alive)."
+        )
+    return (
+        "[IMPORTANT: You are running as a scheduled cron job. "
+        "DELIVERY: Your final response will be automatically delivered "
+        "to the user — do NOT use send_message or try to deliver "
+        "the output yourself. Just produce your report/output as your "
+        "final response and the system handles the rest. "
+        "SILENT: If there is genuinely nothing new to report, respond "
+        "with exactly \"[SILENT]\" (nothing else) to suppress delivery. "
+        "Never combine [SILENT] with content — either report your "
+        "findings normally, or say [SILENT] and nothing more."
+        + completion +
+        "]\n\n"
+    )
+
+
+def _terminate_completed_recurring_job(job: dict) -> None:
+    """Stop a recurring job whose agent signalled ``[DONE]``.
+
+    Pauses (does not delete) so the completed job stays auditable and
+    resumable. One-shot jobs are skipped — they already self-terminate via the
+    repeat limit, and pausing a just-popped one-shot would be a no-op anyway.
+    """
+    if not _is_recurring_schedule(job):
+        return
+    try:
+        pause_job(job["id"], reason="completed: agent signalled [DONE]")
+        logger.info("Job '%s': stopped after agent signalled [DONE]", job.get("id"))
+    except Exception as e:  # never let cleanup failure break the run
+        logger.error("Failed to stop completed job %s: %s", job.get("id"), e)
 
 # ---------------------------------------------------------------------------
 # Persistent thread pool for parallel cron jobs.
@@ -2673,19 +2765,10 @@ def _build_job_prompt(
                 logger.warning("context_from: failed to read output for job %r: %s", source_job_id, e)
                 # silent skip — do not pollute the prompt with error messages
 
-    # Always prepend cron execution guidance so the agent knows how
-    # delivery works and can suppress delivery when appropriate.
-    cron_hint = (
-        "[IMPORTANT: You are running as a scheduled cron job. "
-        "DELIVERY: Your final response will be automatically delivered "
-        "to the user — do NOT use send_message or try to deliver "
-        "the output yourself. Just produce your report/output as your "
-        "final response and the system handles the rest. "
-        "SILENT: If there is genuinely nothing new to report, respond "
-        "with exactly \"[SILENT]\" (nothing else) to suppress delivery. "
-        "Never combine [SILENT] with content — either report your "
-        "findings normally, or say [SILENT] and nothing more.]\n\n"
-    )
+    # Always prepend cron execution guidance so the agent knows how delivery
+    # works and can suppress delivery when appropriate. Recurring jobs also
+    # learn the [DONE] completion protocol (see _cron_execution_hint).
+    cron_hint = _cron_execution_hint(job)
     prompt = cron_hint + prompt
     if skills is None:
         legacy = job.get("skill")
@@ -4181,6 +4264,14 @@ def run_one_job(
             # If the agent responded with [SILENT], skip delivery (but
             # output is already saved above).  Failed jobs always deliver.
             deliver_content = final_response if success else _summarize_cron_failure_for_delivery(job, error)
+            # A successful recurring monitor can stop itself by ending its
+            # final response with [DONE].  Strip the control marker before
+            # delivery, then pause the job after its final run is recorded.
+            done_signaled = bool(success) and bool(
+                _DONE_TAIL_RE.search(deliver_content)
+            )
+            if done_signaled:
+                deliver_content = _DONE_TAIL_RE.sub("", deliver_content)
             # Treat whitespace-only final responses the same as empty
             # responses: do not deliver a blank message, and let the
             # empty-response guard below mark the run as a soft failure.
@@ -4237,6 +4328,11 @@ def run_one_job(
             error=error,
             delivery_outcome=delivery_outcome,
         )
+        # Stop a recurring job whose agent signalled completion. Done AFTER
+        # mark_job_run so the final run is recorded; pausing is a no-op for a
+        # one-shot that mark_job_run already removed.
+        if done_signaled:
+            _terminate_completed_recurring_job(job)
         return True
 
     except BaseException as e:  # noqa: BLE001 — deliberate: see below

@@ -218,6 +218,7 @@ from agent.tool_dispatch_helpers import (
     _extract_file_mutation_targets,
     _extract_landed_file_mutation_paths,
     _extract_error_preview,
+    _extract_tool_error_code,
     _trajectory_normalize_msg,  # noqa: F401  # re-exported for tests that `from run_agent import _trajectory_normalize_msg`
 )
 from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_float, is_truthy_value, model_forces_max_completion_tokens
@@ -2229,6 +2230,23 @@ class AIAgent:
                     ]
                 elif isinstance(msg.get("tool_calls"), list):
                     tool_calls_data = msg["tool_calls"]
+                # Attach the inbound platform message id to this turn's user
+                # row.  On successful gateway turns the agent batch is the
+                # authoritative writer, so a NULL here makes the gateway's
+                # replay guard ineffective.  Preserve an id already carried by
+                # the message (yuanbao convention); otherwise use the current
+                # turn override staged by build_turn_context.
+                _platform_msg_id = (
+                    msg.get("platform_message_id") or msg.get("message_id")
+                )
+                if (
+                    not _platform_msg_id
+                    and role == "user"
+                    and is_current_turn_user
+                ):
+                    _platform_msg_id = getattr(
+                        self, "_persist_user_message_platform_id", None
+                    )
                 _batch_rows.append({
                     "role": role,
                     "content": content,
@@ -2245,6 +2263,7 @@ class AIAgent:
                     "codex_message_items": msg.get("codex_message_items"),
                     "timestamp": _row_timestamp,
                     "api_content": _row_api_content,
+                    "platform_message_id": _platform_msg_id,
                     # Standalone reference handoffs are always hidden, even
                     # when the summarized transcript contained a user turn —
                     # otherwise they occupy the active user slot in
@@ -3439,6 +3458,7 @@ class AIAgent:
                 changed.update(_extract_landed_file_mutation_paths(tool_name, args, result))
         if is_error and not landed:
             preview = _extract_error_preview(result)
+            error_code = _extract_tool_error_code(result)
             for path in targets:
                 # Keep the FIRST error we saw for a given path unless we
                 # later see success.  A repeated failure with a different
@@ -3447,6 +3467,7 @@ class AIAgent:
                     state[path] = {
                         "tool": tool_name,
                         "error_preview": preview,
+                        "error_code": error_code,
                     }
         else:
             for path in targets:
@@ -3508,30 +3529,139 @@ class AIAgent:
             return text
         return cls._FOOTER_PATH_RE.sub(lambda m: f"`{m.group(0)}`", text)
 
+    @staticmethod
+    def _is_temp_verification_helper_failure(
+        path: str, info: Dict[str, Any], roots: List[str]
+    ) -> bool:
+        """True iff a failure is a disposable temp verification helper, not a
+        real target. Requires ALL: error_code=='sensitive_path_denied'; path
+        under tempfile.gettempdir() (resolved, handles /var vs /private/var);
+        basename starts with one of the authoritative disposable-helper prefixes
+        ('hermes-verify-', 'hermes-ad-hoc-'), imported from verification_evidence
+        rather than re-hardcoded so it can never drift from what the runtime
+        emits; and path NOT under any edited project root. Any miss -> False ->
+        treated as a real target and warned."""
+        if (info or {}).get("error_code") != "sensitive_path_denied":
+            return False
+        try:
+            # Import the authoritative prefix tuple rather than re-hardcoding it,
+            # so the classifier and the runtime recorder (verification_evidence,
+            # which emits BOTH hermes-verify- and hermes-ad-hoc-) can never
+            # drift. Inside the try so an ImportError is fail-safe -> warn.
+            from agent.verification_evidence import _AD_HOC_SCRIPT_NAME_PREFIXES
+            p = Path(path).expanduser().resolve(strict=False)
+            tmp = Path(tempfile.gettempdir()).expanduser().resolve(strict=False)
+        except (OSError, ImportError):
+            return False
+        try:
+            p.relative_to(tmp)
+        except ValueError:
+            return False
+        # str.startswith accepts a tuple; matches BOTH disposable-helper prefixes.
+        if not p.name.startswith(_AD_HOC_SCRIPT_NAME_PREFIXES):
+            return False
+        for cp in roots:
+            try:
+                root = Path(cp).expanduser().resolve(strict=False)
+                # _turn_file_mutation_paths holds FILE paths -> anchor on parent dir
+                root = root if root.is_dir() else root.parent
+                p.relative_to(root)
+                return False   # under an edited project root -> target, not helper
+            except (ValueError, OSError):
+                continue
+        return True
+
     @classmethod
-    def _format_file_mutation_failure_footer(cls, failed: Dict[str, Dict[str, Any]]) -> str:
+    def _workspace_verification_passed(
+        cls, roots: List[str], session_id: Optional[str]
+    ) -> bool:
+        """True iff the edited workspace root already has a fresh 'passed'
+        verification record for this session. verification_status returns a DICT
+        keyed 'status'; read .get('status'), the SAME key verification_stop.py
+        reads. Any error -> False (show the info note, never falsely claim
+        green)."""
+        if not roots:
+            return False
+        try:
+            from agent.verification_evidence import verification_status
+        except Exception:
+            return False
+        for root in roots:
+            try:
+                status = verification_status(session_id=session_id, cwd=root)
+            except Exception:
+                continue
+            if isinstance(status, dict) and str(status.get("status") or "") == "passed":
+                return True
+        return False
+
+    @classmethod
+    def _format_file_mutation_failure_footer(
+        cls,
+        failed: Dict[str, Dict[str, Any]],
+        changed_paths: Optional[List[str]] = None,
+        session_id: Optional[str] = None,
+    ) -> str:
         """Render the per-turn failed-mutation dict as a user-facing footer.
 
-        Displays up to 10 paths with their first error preview, then a
-        count of any additional failures.  Returns an empty string when
-        the dict is empty so callers can concatenate unconditionally.
+        Splits failures into real *targets* (warned) and disposable temp
+        *verification helpers* (suppressed/info-noted).  Returns an empty
+        string when the dict is empty so callers can concatenate
+        unconditionally.
 
         Every file path that reaches the user-facing text — both the bullet
         path and any path echoed inside the tool's error preview — is
         backtick-wrapped via ``_neutralize_footer_paths`` so the gateway's
         bare-path media extractor can never auto-attach a protected file
         (e.g. ``~/.hermes/config.yaml``) to a messaging channel (#35584).
+
+        FAIL-OPEN: the partition and the verification_status DB read are each
+        fenced; if either raises, the footer degrades to legacy warn-all so a
+        real 'NOT modified' is NEVER silently dropped via turn_finalizer's outer
+        exception swallow.
         """
         if not failed:
             return ""
+        # --- partition (fail-open) -------------------------------------------
+        roots = [str(p) for p in (changed_paths or [])]
+        try:
+            targets = {
+                p: i
+                for p, i in failed.items()
+                if not cls._is_temp_verification_helper_failure(p, i, roots)
+            }
+            helpers = {p: i for p, i in failed.items() if p not in targets}
+        except Exception:
+            # Classification blew up (e.g. Path.resolve OSError) — degrade to
+            # legacy warn-all so a real 'NOT modified' is NEVER silently dropped.
+            logger.debug("footer helper partition failed; warning all", exc_info=True)
+            targets, helpers = dict(failed), {}
+        # --- helpers-only branches -------------------------------------------
+        if not targets and helpers:
+            try:
+                passed = cls._workspace_verification_passed(roots, session_id)
+            except Exception:
+                # verification_status DB read raised (sqlite OperationalError) —
+                # never claim green; fall through to the info note.
+                logger.debug("footer verification check failed", exc_info=True)
+                passed = False
+            if passed:
+                return ""   # edited root already verified green
+            return cls._neutralize_footer_paths(
+                "ℹ️ File-mutation verifier: a temporary verification helper could "
+                "not be written via the file tool (OS temp path safety). If you "
+                "created and ran it through the terminal instead, no action is "
+                "needed; otherwise re-run your check."
+            )
+        # --- targets branch (legacy warn, helpers excluded) ------------------
         lines = [
             "⚠️ File-mutation verifier: "
-            f"{len(failed)} file(s) were NOT modified this turn despite any "
+            f"{len(targets)} file(s) were NOT modified this turn despite any "
             "wording above that may suggest otherwise. Run `git status` or "
             "`read_file` to confirm."
         ]
         shown = 0
-        for path, info in failed.items():
+        for path, info in targets.items():     # NOTE: iterate targets, not failed
             if shown >= 10:
                 break
             preview = (info.get("error_preview") or "").strip()
@@ -3541,7 +3671,7 @@ class AIAgent:
             else:
                 lines.append(f"  • `{path}` — [{tool}] failed")
             shown += 1
-        remaining = len(failed) - shown
+        remaining = len(targets) - shown
         if remaining > 0:
             lines.append(f"  • … and {remaining} more")
         # Neutralize any path the preview text echoed (the bullet path is
@@ -7802,6 +7932,7 @@ class AIAgent:
         stream_callback: Optional[callable] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        persist_user_platform_message_id: Optional[str] = None,
         persist_user_display_kind: Optional[str] = None,
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
@@ -7896,6 +8027,7 @@ class AIAgent:
                     stream_callback,
                     persist_user_message,
                     persist_user_timestamp=persist_user_timestamp,
+                    persist_user_platform_message_id=persist_user_platform_message_id,
                     persist_user_display_kind=persist_user_display_kind,
                     persist_user_display_metadata=persist_user_display_metadata,
                     moa_config=moa_config,

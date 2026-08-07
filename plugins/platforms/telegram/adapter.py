@@ -794,6 +794,10 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_progress_verifier_task: Optional[asyncio.Task] = None
         self._polling_teardown_started: bool = False
         self._polling_error_callback_ref = None
+        # Highest inbound update handed to the gateway, persisted so a fresh
+        # long-poll process can reject Telegram backlog re-delivery.
+        self._telegram_offset_high: Optional[int] = None
+        self._telegram_offset_loaded: bool = False
         self._polling_heartbeat_task: Optional[asyncio.Task] = None
         # Live @username, refreshed whenever Telegram tells us what it is.
         # PTB caches getMe() in Bot._bot_user at initialize() and only rewrites
@@ -9030,6 +9034,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
             existing._last_chunk_len = chunk_len  # type: ignore[attr-defined]
+            self._merge_platform_update_high_watermark(existing, event)
             # Merge any media that might be attached
             if event.media_urls:
                 existing.media_urls.extend(event.media_urls)
@@ -9136,6 +9141,7 @@ class TelegramAdapter(BasePlatformAdapter):
         else:
             existing.media_urls.extend(event.media_urls)
             existing.media_types.extend(event.media_types)
+            self._merge_platform_update_high_watermark(existing, event)
             if event.text:
                 existing.text = self._merge_caption(existing.text, event.text)
 
@@ -9463,6 +9469,7 @@ class TelegramAdapter(BasePlatformAdapter):
         else:
             existing.media_urls.extend(event.media_urls)
             existing.media_types.extend(event.media_types)
+            self._merge_platform_update_high_watermark(existing, event)
             if event.text:
                 existing.text = self._merge_caption(existing.text, event.text)
 
@@ -9722,6 +9729,81 @@ class TelegramAdapter(BasePlatformAdapter):
             return text or None
         except Exception:
             return None
+
+    # ── Cross-restart long-poll replay guard ─────────────────────────────
+
+    @staticmethod
+    def _merge_platform_update_high_watermark(
+        existing: MessageEvent, incoming: MessageEvent
+    ) -> None:
+        """Keep a merged batch's highest constituent Telegram update id.
+
+        Split text and media albums become one logical gateway event. Keeping
+        the first constituent's id would leave later, already-consumed chunks
+        above the durable offset, allowing them to replay after a restart.
+        """
+        incoming_id = getattr(incoming, "platform_update_id", None)
+        if not isinstance(incoming_id, int):
+            return
+        existing_id = getattr(existing, "platform_update_id", None)
+        if not isinstance(existing_id, int) or incoming_id > existing_id:
+            existing.platform_update_id = incoming_id
+
+    def _telegram_offset_file(self):
+        from hermes_constants import get_hermes_home
+
+        return get_hermes_home() / ".telegram_offset.json"
+
+    def _telegram_offset_key(self) -> str:
+        # get_hermes_home() is profile-scoped, so the platform name is stable
+        # and does not expose a bot token in the on-disk key.
+        return str(getattr(self, "name", None) or "telegram")
+
+    def _load_telegram_offset(self) -> Optional[int]:
+        if self._telegram_offset_loaded:
+            return self._telegram_offset_high
+        self._telegram_offset_loaded = True
+        try:
+            path = self._telegram_offset_file()
+            if path.exists():
+                data = json.loads(path.read_text(encoding="utf-8"))
+                value = data.get(self._telegram_offset_key()) if isinstance(data, dict) else None
+                if isinstance(value, int):
+                    self._telegram_offset_high = value
+        except Exception:
+            logger.debug("[%s] Telegram offset load skipped", self.name, exc_info=True)
+        return self._telegram_offset_high
+
+    def _is_replayed_platform_update(self, event: MessageEvent) -> bool:
+        update_id = getattr(event, "platform_update_id", None)
+        if not isinstance(update_id, int):
+            return False
+        high = self._load_telegram_offset()
+        return high is not None and update_id <= high
+
+    def _note_platform_update_processed(self, event: MessageEvent) -> None:
+        update_id = getattr(event, "platform_update_id", None)
+        if not isinstance(update_id, int):
+            return
+        high = self._load_telegram_offset()
+        if high is not None and update_id <= high:
+            return
+
+        path = self._telegram_offset_file()
+        data: Dict[str, Any] = {}
+        try:
+            if path.exists():
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    data = loaded
+            data[self._telegram_offset_key()] = update_id
+
+            from utils import atomic_json_write
+
+            atomic_json_write(path, data, indent=None, mode=0o600)
+            self._telegram_offset_high = update_id
+        except Exception:
+            logger.debug("[%s] Telegram offset persist skipped", self.name, exc_info=True)
 
     def _build_message_event(
         self,

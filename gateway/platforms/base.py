@@ -5560,6 +5560,14 @@ class BasePlatformAdapter(ABC):
 
         await self._drain_pending_after_session_command(session_key, command_guard)
 
+    def _is_replayed_platform_update(self, event: MessageEvent) -> bool:
+        """Return whether an adapter has already processed this update."""
+        return False
+
+    def _note_platform_update_processed(self, event: MessageEvent) -> None:
+        """Persist an adapter-specific processed-update watermark."""
+        return None
+
     async def handle_message(self, event: MessageEvent) -> None:
         """
         Process an incoming message.
@@ -5570,6 +5578,27 @@ class BasePlatformAdapter(ABC):
         """
         if not self._message_handler:
             return
+
+        # Telegram's long poll can redeliver an acknowledged update after a
+        # process restart. Adapters without durable offsets inherit inert
+        # hooks, keeping this platform-generic and backward compatible.
+        try:
+            if self._is_replayed_platform_update(event):
+                logger.info(
+                    "[%s] Dropping replayed platform update %s",
+                    self.name,
+                    getattr(event, "platform_update_id", None),
+                )
+                return
+            self._note_platform_update_processed(event)
+        except Exception:
+            # Offset persistence is defense-in-depth; a bookkeeping problem
+            # must not make the platform unavailable.
+            logger.debug(
+                "[%s] replay-offset bookkeeping skipped",
+                self.name,
+                exc_info=True,
+            )
 
         coerce_plaintext_gateway_command(event)
 

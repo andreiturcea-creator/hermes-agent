@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from agent.coding_context import facts_are_verifiable, project_facts_for
 from agent.verification_evidence import (
     mark_workspace_edited,
     record_terminal_result,
@@ -142,6 +143,43 @@ def test_nudge_checks_all_edited_workspaces(tmp_path, monkeypatch):
 
 
 
+def test_nudge_includes_failed_output_summary(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _node_project(tmp_path)
+    changed = str(tmp_path / "src" / "app.ts")
+
+    record_terminal_result(
+        command="pnpm test",
+        cwd=tmp_path,
+        session_id="s1",
+        exit_code=1,
+        output="expected 1 got 2",
+    )
+
+    nudge = build_verify_on_stop_nudge(session_id="s1", changed_paths=[changed])
+
+    assert nudge is not None
+    assert "failed" in nudge
+    assert "expected 1 got 2" in nudge
+    assert "repair the code" in nudge
+
+
+def test_no_suite_nudge_requests_temp_script(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+    changed = str(tmp_path / "src" / "app.ts")
+
+    nudge = build_verify_on_stop_nudge(session_id="s1", changed_paths=[changed])
+
+    assert nudge is not None
+    assert tempfile.gettempdir() in nudge
+    assert "hermes-verify-" in nudge
+    assert "terminal" in nudge
+    assert "write_file" in nudge
+    assert "ad-hoc" in nudge          # token survives; full phrase does not
+    assert "ad-hoc verification" not in nudge
+    assert "suite green" not in nudge
+    assert "creative UI/visual work" in nudge
 
 
 def test_no_suite_nudge_uses_canonical_temp_dir(tmp_path, monkeypatch):
@@ -185,6 +223,63 @@ def test_ad_hoc_pass_satisfies_no_suite_stop_loop(tmp_path, monkeypatch):
         script.unlink(missing_ok=True)
 
     assert build_verify_on_stop_nudge(session_id="s1", changed_paths=[changed]) is None
+
+
+# ---------------------------------------------------------------------------
+# Context-only roots must not be treated as verifiable
+# ---------------------------------------------------------------------------
+
+
+def test_facts_are_verifiable_context_only_root_false(tmp_path):
+    """A context-only root (only CLAUDE.md, no manifest, no .git) yields a
+    truthy facts dict but is NOT verifiable."""
+    (tmp_path / "CLAUDE.md").write_text("# context\n", encoding="utf-8")
+    facts = project_facts_for(tmp_path)
+    assert facts  # project_facts_for stays truthy (contract unchanged)
+    assert facts_are_verifiable(facts) is False
+
+
+def test_no_nudge_in_context_only_root(tmp_path, monkeypatch):
+    """An edit in a context-only root must NOT emit the verify-on-stop nudge,
+    even when the changed path is a code file (the doc-extension filter alone
+    would not suppress it)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    (tmp_path / "CLAUDE.md").write_text("# context\n", encoding="utf-8")
+    (tmp_path / "AGENTS.md").write_text("# agents\n", encoding="utf-8")
+    changed = str(tmp_path / "helper.py")
+
+    assert build_verify_on_stop_nudge(session_id="s1", changed_paths=[changed]) is None
+
+
+def test_nudge_still_fires_in_marker_root_with_verify_commands(tmp_path, monkeypatch):
+    """A node project with a real test script (non-empty verifyCommands) still
+    nudges — guards against over-suppression."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _node_project(tmp_path)
+    changed = str(tmp_path / "src" / "app.ts")
+
+    nudge = build_verify_on_stop_nudge(session_id="s1", changed_paths=[changed])
+
+    assert nudge is not None
+
+
+def test_facts_are_verifiable_bare_git_repo_true(tmp_path):
+    """A bare git repo with code but no manifest/verify is still verifiable via
+    the .git check."""
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "app.py").write_text("print('hi')\n", encoding="utf-8")
+    facts = project_facts_for(tmp_path)
+    assert facts
+    assert facts_are_verifiable(facts) is True
+
+
+def test_facts_are_verifiable_empty_package_json_true(tmp_path):
+    """An empty package.json '{}' is a manifest -> verifiable."""
+    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+    facts = project_facts_for(tmp_path)
+    assert facts
+    assert facts.get("manifests")
+    assert facts_are_verifiable(facts) is True
 
 
 def test_nudge_attempts_are_bounded(tmp_path, monkeypatch):

@@ -18,8 +18,89 @@ from tools.environments.base import BaseEnvironment, _pipe_stdin
 from hermes_cli._subprocess_compat import windows_hide_flags
 
 _IS_WINDOWS = platform.system() == "Windows"
+_IS_MACOS = platform.system() == "Darwin"
 
 logger = logging.getLogger(__name__)
+
+
+def _setsid_exec_prefix(cwd: str | None) -> list[str]:
+    """argv prefix that makes the child ``chdir(cwd)`` then ``setsid()`` then
+    ``exec`` the real command *in place* (pid preserved), so it becomes a
+    session / process-group leader **without** ``subprocess``'
+    ``start_new_session=True`` and starts in the same directory the old
+    ``Popen(cwd=...)`` would have used.
+
+    Why: ``start_new_session=True`` (along with ``close_fds=True`` and a
+    non-``None`` ``cwd``) forces CPython off ``os.posix_spawn`` onto the legacy
+    ``fork()+exec()`` path.  On a long-lived macOS gateway that has
+    Network.framework loaded in-process (higgsfield MCP OAuth retry loop), the
+    framework registered a ``pthread_atfork`` CHILD handler; the forked child
+    runs it before ``exec`` and SIGSEGVs (``nw_settings_child_has_forked``).
+    ``posix_spawn`` does NOT run ``pthread_atfork`` handlers, so we route the
+    spawn through it — but it loses both the new-session isolation
+    ``_kill_process`` relies on AND the ``cwd=`` Popen sets, so we recreate
+    both here.
+
+    The ``chdir`` reproduces the old ``Popen(cwd=_popen_cwd)`` start directory.
+    Without it the spawn would inherit the *gateway* process's cwd, and any
+    **relative** ``builtin cd`` the bash wrapper later runs (a relative
+    ``workdir=`` is accepted by the terminal tool) — plus ``$OLDPWD`` and the
+    pre-``cd`` ``$PWD`` — would resolve against the wrong base.  ``chdir`` is
+    best-effort: ``cwd`` is the already-existence-checked ``_resolve_safe_cwd``
+    result, so it succeeds in practice; if it somehow fails we still ``setsid``
+    + ``exec`` so the fork-safety and group isolation hold and the wrapper's
+    absolute ``cd`` still lands correctly.
+
+    macOS ships no ``setsid(1)``, and CPython 3.11's ``os.posix_spawn`` exposes
+    neither ``setsid`` nor ``setpgroup`` (and passing ``process_group=`` to
+    ``Popen`` would itself force the fork path), so a tiny exec shim is the
+    portable way to become a group leader while staying on ``posix_spawn``.
+    The shim ``exec``s in place (no second fork) so ``proc.pid`` IS the new
+    group leader and a ``killpg(proc.pid, ...)`` still kills the whole group.
+    Run only on macOS; spawned itself via ``posix_spawn`` (a fresh image with
+    no inherited atfork handlers), so its own ``setsid()`` is fork-safe.
+
+    ``setsid`` failure is fatal (``exit 127``): if it failed we would still be
+    in the gateway's process group, and exec-ing there would both escape the
+    ``killpg(proc.pid)`` kill (wrong group) and, worse, risk a later live
+    ``getpgid`` reading the gateway group.  Note ``POSIX::setsid()`` returns
+    ``-1`` (defined + truthy) on failure, so it must be compared to ``-1``
+    explicitly — ``or``/``defined`` guards would miss it.  In practice it never
+    fails here (a freshly ``posix_spawn``ed child is never a group leader).
+    """
+    cwd_arg = cwd if cwd else ""
+    perl = shutil.which("perl")
+    if perl:
+        # ``--`` ends perl option parsing; @ARGV becomes
+        # [cwd, bash, "-c", cmd, ...].  ``shift`` consumes the cwd, then the
+        # block form ``exec { PROGRAM } LIST`` execs the literal PROGRAM with
+        # LIST as argv — no PATH lookup, no shell, no fork.
+        return [
+            perl,
+            "-e",
+            "use POSIX (); my $d = shift @ARGV; "
+            "chdir($d) if defined $d && length $d; "
+            "exit 127 if POSIX::setsid() == -1; "
+            "exec { $ARGV[0] } @ARGV; exit 127;",
+            "--",
+            cwd_arg,
+        ]
+    # Fallback to the interpreter we are already running (always present).
+    # os.setsid() raises on failure, so the process exits without exec-ing into
+    # the gateway's group; os.chdir failure is swallowed (best-effort, matching
+    # the perl path).
+    return [
+        sys.executable,
+        "-c",
+        "import os, sys\n"
+        "d = sys.argv[1]\n"
+        "if d:\n"
+        "    try: os.chdir(d)\n"
+        "    except OSError: pass\n"
+        "os.setsid()\n"
+        "os.execv(sys.argv[2], sys.argv[2:])\n",
+        cwd_arg,
+    ]
 
 
 def _msys_to_windows_path(cwd: str) -> str:
@@ -1529,6 +1610,32 @@ class LocalEnvironment(BaseEnvironment):
 
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 
+        # macOS fork()-safety: keep this spawn on ``os.posix_spawn`` instead of
+        # ``fork()+exec()``.  On a long-lived gateway with Network.framework
+        # loaded (higgsfield MCP OAuth loop), the forked child runs a
+        # ``pthread_atfork`` CHILD handler and SIGSEGVs before exec.  CPython
+        # only uses ``posix_spawn`` when ``close_fds`` is False, ``cwd`` is
+        # None, and ``start_new_session`` is False — so on Darwin we drop those
+        # three blockers and recreate, inside an in-place chdir+setsid+exec
+        # shim, both (a) the new-session/process-group isolation that
+        # ``_kill_process``' killpg needs and (b) the start directory that
+        # ``Popen(cwd=_popen_cwd)`` provided.  Passing ``_popen_cwd`` to the
+        # shim (not relying solely on the wrapper's ``builtin cd``) keeps
+        # *relative* cd targets, ``$OLDPWD`` and the pre-``cd`` ``$PWD``
+        # resolving against the same base as before; the ``_resolve_safe_cwd``
+        # recovery above still updates ``self.cwd`` for subsequent calls.
+        # ``close_fds=False`` is safe because CPython opens fds non-inheritable
+        # (O_CLOEXEC) by default, and we pass no ``pass_fds``; only the dup2'd
+        # std pipes cross the exec.
+        _use_posix_spawn = _IS_MACOS and not _IS_WINDOWS
+        if _use_posix_spawn:
+            args = _setsid_exec_prefix(_popen_cwd) + args
+            _popen_kwargs["close_fds"] = False
+            _popen_kwargs["cwd"] = None
+        else:
+            _popen_kwargs["start_new_session"] = True
+            _popen_kwargs["cwd"] = _popen_cwd
+
         proc = subprocess.Popen(
             args,
             text=True,
@@ -1538,15 +1645,22 @@ class LocalEnvironment(BaseEnvironment):
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
-            start_new_session=True,
-            cwd=_popen_cwd,
             **_popen_kwargs,
         )
         if not _IS_WINDOWS:
-            try:
-                proc._hermes_pgid = os.getpgid(proc.pid)
-            except ProcessLookupError:
-                pass
+            if _use_posix_spawn:
+                # The setsid+exec shim execs the real command in place, so the
+                # process at ``proc.pid`` becomes its own session/group leader
+                # with pgid == proc.pid.  Record it deterministically: calling
+                # os.getpgid(proc.pid) here could race the shim's setsid()
+                # (which runs a beat after posix_spawn returns) and read the
+                # GATEWAY's group — which _kill_process must never killpg.
+                proc._hermes_pgid = proc.pid
+            else:
+                try:
+                    proc._hermes_pgid = os.getpgid(proc.pid)
+                except ProcessLookupError:
+                    pass
 
         if stdin_data is not None:
             _pipe_stdin(proc, stdin_data)
@@ -1598,12 +1712,27 @@ class LocalEnvironment(BaseEnvironment):
                 except (subprocess.TimeoutExpired, OSError):
                     pass
             else:
-                try:
-                    pgid = os.getpgid(proc.pid)
-                except ProcessLookupError:
-                    pgid = getattr(proc, "_hermes_pgid", None)
-                    if pgid is None:
-                        raise
+                # On the macOS posix_spawn + setsid-shim path the child's pgid
+                # is deterministically ``proc.pid`` (recorded in
+                # ``_hermes_pgid``).  Prefer that cached value over a live
+                # ``os.getpgid(proc.pid)``: in the sub-millisecond window after
+                # ``posix_spawn`` returns and before the shim runs ``setsid()``,
+                # the child is still in the GATEWAY's process group, so a live
+                # ``getpgid`` could return the gateway pgid and ``killpg`` would
+                # then signal the gateway itself.  The cached value can only
+                # ever name the child's own group, never the gateway's.  On
+                # other POSIX hosts (fork path) keep the original live-first
+                # lookup byte-for-byte.
+                cached_pgid = getattr(proc, "_hermes_pgid", None)
+                if _IS_MACOS and cached_pgid is not None:
+                    pgid = cached_pgid
+                else:
+                    try:
+                        pgid = os.getpgid(proc.pid)
+                    except ProcessLookupError:
+                        pgid = cached_pgid
+                        if pgid is None:
+                            raise
 
                 try:
                     os.killpg(pgid, signal.SIGTERM)  # windows-footgun: ok — POSIX process-group SIGTERM (guarded by _IS_WINDOWS above)

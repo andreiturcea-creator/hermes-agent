@@ -507,6 +507,33 @@ def _extract_error_preview(result: Any, max_len: int = 180) -> str:
     return text
 
 
+def _extract_tool_error_code(result: Any) -> Optional[str]:
+    """Pull the structured ``error_code`` from a tool result, tolerating the
+    guardrail '[Tool loop warning: ...]' suffix that tool_executor appends to
+    the result BEFORE the file-mutation recorder runs (tool_guardrails.append_
+    toolguard_guidance, 2nd exact failure). A plain json.loads of a suffixed
+    string raises, so slice to the LAST '}' first. SUPPRESSION-DIRECTION
+    invariant: the slice only ever feeds json.loads a prefix of the real result,
+    so it can never fabricate error_code=='sensitive_path_denied'; worst case is
+    None -> the failure is treated as a real target and warned.
+    """
+    text = _multimodal_text_summary(result) if result is not None else ""
+    if not isinstance(text, str):
+        return None
+    stripped = text.strip()
+    end = stripped.rfind("}")
+    if not stripped.startswith("{") or end == -1:
+        return None
+    try:
+        data = json.loads(stripped[: end + 1])
+    except Exception:
+        return None
+    if isinstance(data, dict):
+        code = data.get("error_code")
+        return code if isinstance(code, str) else None
+    return None
+
+
 def _trajectory_normalize_msg(msg: Dict[str, Any]) -> Dict[str, Any]:
     """Strip image blobs from a message for trajectory saving.
 
@@ -727,6 +754,7 @@ __all__ = [
     "_extract_file_mutation_targets",
     "_extract_landed_file_mutation_paths",
     "_extract_error_preview",
+    "_extract_tool_error_code",
     "_trajectory_normalize_msg",
     "make_tool_result_message",
 ]

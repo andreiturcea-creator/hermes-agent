@@ -483,7 +483,11 @@ def finalize_turn(
         try:
             _failed = getattr(agent, "_turn_failed_file_mutations", None) or {}
             if _failed and agent._file_mutation_verifier_enabled():
-                footer = agent._format_file_mutation_failure_footer(_failed)
+                footer = agent._format_file_mutation_failure_footer(
+                    _failed,
+                    changed_paths=getattr(agent, "_turn_file_mutation_paths", None),
+                    session_id=getattr(agent, "session_id", None),
+                )
                 if footer:
                     final_response = final_response.rstrip() + "\n\n" + footer
         except Exception as _ver_err:

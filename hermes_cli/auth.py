@@ -624,6 +624,13 @@ def has_usable_secret(value: Any, *, min_length: int = 4) -> bool:
         return False
     if cleaned.lower() in _PLACEHOLDER_SECRET_VALUES:
         return False
+    # (local-patch: venice-pool-seed-guard) An unexpanded "${VAR}" template is a
+    # config placeholder that survived _expand_env_vars (var absent from
+    # os.environ at config-cache time), never a real secret. Accepting it lets the
+    # literal beat the correct key_env resolution and be sent as a bearer token
+    # -> HTTP 401. A genuine API key never starts with "${".
+    if cleaned.startswith("${") and cleaned.endswith("}"):
+        return False
     return True
 
 

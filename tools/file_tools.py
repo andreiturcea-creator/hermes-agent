@@ -672,8 +672,18 @@ def _get_hermes_config_resolved() -> str | None:
     return _hermes_config_resolved
 
 
-def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None:
-    """Return an error message if the path targets a sensitive system location."""
+def _check_sensitive_path(
+    filepath: str, task_id: str = "default"
+) -> tuple[str, str | None] | None:
+    """Return ``(message, error_code | None)`` if the path is sensitive, else ``None``.
+
+    The path-safety branches (``_SENSITIVE_PATH_PREFIXES`` /
+    ``_SENSITIVE_EXACT_PATHS``) carry ``error_code='sensitive_path_denied'`` so a
+    blocked disposable verifier helper can be distinguished downstream from a real
+    target failure. The Hermes-config refusal is a genuine target failure, so it
+    returns ``(msg, None)`` (no helper code). The SAFE path returns a bare ``None``
+    (NOT ``(None, None)``) so callers must GUARD BEFORE UNPACK.
+    """
     try:
         resolved = str(_resolve_path_for_task(filepath, task_id))
     except (OSError, ValueError):
@@ -685,9 +695,9 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     )
     for prefix in _SENSITIVE_PATH_PREFIXES:
         if resolved.startswith(prefix) or normalized.startswith(prefix):
-            return _err
+            return _err, "sensitive_path_denied"
     if resolved in _SENSITIVE_EXACT_PATHS or normalized in _SENSITIVE_EXACT_PATHS:
-        return _err
+        return _err, "sensitive_path_denied"
     # Prevent agents from modifying the Hermes config file directly.
     # approvals.mode and other security settings live here; a malicious or
     # prompt-injected agent could silently disable exec approval by writing to
@@ -698,7 +708,7 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
             f"Refusing to write to Hermes config file: {filepath}\n"
             "Agent cannot modify security-sensitive configuration. "
             "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead."
-        )
+        ), None
     return None
 
 
@@ -1765,9 +1775,16 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     Pass ``True`` after explicit user direction — same shape as ``force``
     on the terminal tool.
     """
-    sensitive_err = _check_sensitive_path(path, task_id)
-    if sensitive_err:
-        return tool_error(sensitive_err)
+    if Path(path).expanduser().suffix.lower() == ".docx":
+        return tool_error(
+            "Refusing to write text directly to a .docx path. DOCX files are "
+            "ZIP/OOXML packages, not UTF-8 text. Build a separate candidate "
+            "and publish it with ~/.hermes/bin/aster-docx publish."
+        )
+    _sensitive = _check_sensitive_path(path, task_id)
+    if _sensitive:
+        sensitive_err, sensitive_code = _sensitive
+        return tool_error(sensitive_err, **({"error_code": sensitive_code} if sensitive_code else {}))
     if not cross_profile:
         cross_warning = _check_cross_profile_path(path, task_id)
         if cross_warning:
@@ -1786,6 +1803,13 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             _resolved = str(_resolve_path_for_task(path, task_id))
         except Exception:
             _resolved = None
+
+        if _resolved is not None and Path(_resolved).suffix.lower() == ".docx":
+            return tool_error(
+                "Refusing to write text through an alias that resolves to a .docx path. "
+                "Build a separate OOXML candidate and publish it with "
+                "~/.hermes/bin/aster-docx publish."
+            )
 
         if _resolved is None:
             stale_warning = _check_file_staleness(path, task_id)
@@ -1892,10 +1916,22 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 if _err:
                     return _err
                 _paths_to_check.append(v4a_path)
+    _docx_targets = [
+        item for item in _paths_to_check
+        if Path(item).expanduser().suffix.lower() == ".docx"
+    ]
+    if _docx_targets:
+        return tool_error(
+            "Refusing to patch a .docx path as text: "
+            + ", ".join(_docx_targets)
+            + ". Build a separate OOXML candidate and publish it with "
+              "~/.hermes/bin/aster-docx publish."
+        )
     for _p in _paths_to_check:
-        sensitive_err = _check_sensitive_path(_p, task_id)
-        if sensitive_err:
-            return tool_error(sensitive_err)
+        _sensitive = _check_sensitive_path(_p, task_id)
+        if _sensitive:
+            sensitive_err, sensitive_code = _sensitive
+            return tool_error(sensitive_err, **({"error_code": sensitive_code} if sensitive_code else {}))
         if not cross_profile:
             cross_warning = _check_cross_profile_path(_p, task_id)
             if cross_warning:
@@ -1915,6 +1951,16 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 _resolved_paths.append(_r)
                 _seen.add(_r)
         _resolved_paths.sort()
+        _resolved_docx_targets = [
+            item for item in _resolved_paths if Path(item).suffix.lower() == ".docx"
+        ]
+        if _resolved_docx_targets:
+            return tool_error(
+                "Refusing to patch through an alias that resolves to a .docx path: "
+                + ", ".join(_resolved_docx_targets)
+                + ". Build a separate OOXML candidate and publish it with "
+                  "~/.hermes/bin/aster-docx publish."
+            )
 
         # Acquire per-path locks in sorted order via ExitStack.  On single
         # path this degenerates to one lock; on empty list (unresolvable)

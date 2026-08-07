@@ -155,7 +155,7 @@ def _verification_snapshot(
 ) -> tuple[dict[str, Any], dict[str, Any]] | None:
     """Return ``(status, facts)`` for the first edited workspace needing proof."""
     try:
-        from agent.coding_context import project_facts_for
+        from agent.coding_context import facts_are_verifiable, project_facts_for
         from agent.verification_evidence import verification_status
     except Exception:
         return None
@@ -163,7 +163,7 @@ def _verification_snapshot(
     first_snapshot: tuple[dict[str, Any], dict[str, Any]] | None = None
     for cwd in _candidate_cwds(changed_paths):
         facts = project_facts_for(cwd)
-        if not facts:
+        if not facts or not facts_are_verifiable(facts):
             continue
         status = verification_status(session_id=session_id, cwd=cwd)
         snapshot = (status, facts)
@@ -251,12 +251,13 @@ def build_verify_on_stop_nudge(
     else:
         temp_dir = os.path.realpath(tempfile.gettempdir())
         command_instruction = (
-            "No canonical test/lint/build command was detected. Create a focused "
-            f"temporary verification script under `{temp_dir}` using an OS-safe "
-            "`tempfile` path with a `hermes-verify-` filename prefix, run it "
-            "against the changed behavior, clean it up when possible, and "
-            "summarize it explicitly as ad-hoc verification rather than suite "
-            "green."
+            "No canonical test/lint/build command was detected. Use the terminal "
+            "tool (or a Python `tempfile` flow) to create and run a focused "
+            f"temporary verification script under `{temp_dir}` with a "
+            "`hermes-verify-` filename prefix, then clean it up. Do not use "
+            "`write_file` for OS temp roots — file-tool path safety may refuse "
+            "them. Summarize it explicitly as a focused ad-hoc check, not as a "
+            "full canonical suite run."
         )
 
     return (

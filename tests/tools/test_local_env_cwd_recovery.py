@@ -15,9 +15,28 @@ import threading
 from unittest.mock import MagicMock, patch
 
 from tools.environments.local import (
+    _IS_MACOS,
     LocalEnvironment,
     _resolve_safe_cwd,
 )
+
+
+def _assert_child_started_in(captured: dict, expected: str) -> None:
+    """Assert the child was directed to start in ``expected``.
+
+    On macOS the spawn is routed through ``os.posix_spawn`` for fork-safety, so
+    ``cwd`` is intentionally passed to ``Popen`` as ``None`` and the start
+    directory is instead applied by the in-process chdir+setsid+exec shim — the
+    resolved directory therefore appears as a literal element of the spawned
+    ``argv`` (the shim's ``$d``), not in the ``cwd`` kwarg.  On every other host
+    the original ``Popen(cwd=...)`` contract still holds.
+    """
+    if _IS_MACOS:
+        assert captured["cwd"] is None
+        assert expected in (captured.get("cmd") or [])
+    else:
+        assert captured["cwd"] == expected
+    assert os.path.isdir(expected)
 
 
 class TestResolveSafeCwd:
@@ -54,6 +73,7 @@ def _make_fake_popen(captured: dict, fds: list):
     caller can clean up after the test.
     """
     def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
         captured["cwd"] = kwargs.get("cwd")
         captured["env"] = kwargs.get("env", {})
         read_fd, write_fd = os.pipe()
@@ -105,9 +125,8 @@ class TestRunBashCwdRecovery:
         finally:
             _close_fds(fds)
 
-        # Popen must have been handed a real, existing directory.
-        assert captured["cwd"] == str(tmp_path)
-        assert os.path.isdir(captured["cwd"])
+        # The child must have been directed to a real, existing directory.
+        _assert_child_started_in(captured, str(tmp_path))
 
         # ``self.cwd`` is updated so the next call doesn't re-warn.
         assert env.cwd == str(tmp_path)
@@ -130,7 +149,7 @@ class TestRunBashCwdRecovery:
         finally:
             _close_fds(fds)
 
-        assert captured["cwd"] == str(tmp_path)
+        _assert_child_started_in(captured, str(tmp_path))
         assert env.cwd == str(tmp_path)
         assert not any("missing on disk" in rec.message for rec in caplog.records)
 
