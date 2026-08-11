@@ -1399,6 +1399,55 @@ def _normalize_deliver_value(deliver) -> str:
     return str(deliver)
 
 
+def _job_for_run_delivery(job: dict, success: bool, cfg: dict | None) -> dict:
+    """Return the delivery view for this run without mutating the stored job.
+
+    ``cron.failure_deliver`` is a failure-only escape hatch.  It lets routine
+    successes keep their normal destination while failures are diverted to a
+    dedicated operations room (or ``local``).  The override is deliberately
+    applied only after the run result is known and only to the ephemeral job
+    passed to delivery; ``jobs.json`` and the job's origin stay unchanged.
+
+    An invalid/unconfigured override is allowed to fail delivery normally.  It
+    must never fall back to the original chat, because that would silently
+    defeat the operator's request to keep failures out of that surface.
+    """
+    if success or not isinstance(cfg, dict):
+        return job
+    cron_cfg = cfg.get("cron")
+    if not isinstance(cron_cfg, dict):
+        return job
+    override = cron_cfg.get("failure_deliver")
+    if override is None or override == "":
+        return job
+    routed = dict(job)
+    routed["deliver"] = _normalize_deliver_value(override)
+    return routed
+
+
+def _load_cron_delivery_config() -> dict:
+    """Load the current profile config for post-run delivery routing.
+
+    Delivery happens outside ``run_job`` (after its agent result returns), so
+    the model-routing config local to ``run_job`` is intentionally unavailable
+    here.  Re-read through the public read-only loader: config changes then take
+    effect on the next fire without a scheduler restart.  Loader failures use
+    local-only failure capture so they cannot leak an alert to the job's normal
+    chat while the dedicated route is unknowable.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        loaded = load_config_readonly()
+        return loaded if isinstance(loaded, dict) else {}
+    except Exception:
+        logger.warning("Cron failure-delivery config could not be loaded", exc_info=True)
+        # The configured destination is unknowable, so fail closed.  A failed
+        # cron run must not leak back to its ordinary chat merely because the
+        # config became temporarily unreadable.
+        return {"cron": {"failure_deliver": "local"}}
+
+
 # Routing intent tokens — resolved at fire time, not create time, so a
 # job created before Telegram was wired up will pick up Telegram once it
 # comes online.  ``all`` expands into the set of connected platforms
@@ -4649,6 +4698,17 @@ def run_one_job(
                     "(tool subprocess was killed mid-flight)."
                 )
 
+            # Empty agent responses are soft failures (#8585).  Classify them
+            # before choosing both content and destination so failure_deliver
+            # applies; the old late check recorded a failure but silently sent
+            # no immediate alert anywhere.
+            if success and not final_response.strip():
+                success = False
+                error = (
+                    "Agent completed but produced empty response "
+                    "(model error, timeout, or misconfiguration)"
+                )
+
             # Deliver the final response to the origin/target chat.
             # If the agent responded with [SILENT], skip delivery (but
             # output is already saved above).  Failed jobs always deliver.
@@ -4698,29 +4758,41 @@ def run_one_job(
                 logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
                 should_deliver = False
 
+            delivery_job = _job_for_run_delivery(
+                job, success, _load_cron_delivery_config(),
+            )
             if should_deliver:
-                unresolved_origin = (
-                    _normalize_deliver_value(job.get("deliver", "local")) == "origin"
-                    and not _resolve_delivery_targets(job)
+                failure_override_unresolved = (
+                    delivery_job is not job
+                    and _normalize_deliver_value(
+                        delivery_job.get("deliver", "local")
+                    ) != "local"
+                    and not _resolve_delivery_targets(delivery_job)
                 )
-                try:
-                    delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
-                except Exception as de:
-                    delivery_error = str(de)
-                    logger.error("Delivery failed for job %s: %s", job["id"], de)
+                unresolved_origin = (
+                    _normalize_deliver_value(delivery_job.get("deliver", "local")) == "origin"
+                    and not _resolve_delivery_targets(delivery_job)
+                )
+                if failure_override_unresolved:
+                    delivery_error = (
+                        "cron.failure_deliver could not be resolved: "
+                        f"{delivery_job.get('deliver')!r}"
+                    )
+                    logger.error("Job %s: %s", job["id"], delivery_error)
+                else:
+                    try:
+                        delivery_error = _deliver_result(
+                            delivery_job, deliver_content, adapters=adapters, loop=loop,
+                        )
+                    except Exception as de:
+                        delivery_error = str(de)
+                        logger.error("Delivery failed for job %s: %s", job["id"], de)
         finally:
             # Tear down the deferred agent(s) now that save + delivery have run
             # (or raised). Must happen on every path so cron agents never leak
             # their subprocesses/clients (#10200).
             for _deferred_agent in _deferred_agents:
                 _teardown_cron_agent(_deferred_agent, job["id"])
-
-        # Treat empty final_response as a soft failure so last_status
-        # is not "ok" — the agent ran but produced nothing useful.
-        # (issue #8585)
-        if success and not final_response.strip():
-            success = False
-            error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
         if not _consume_interrupted_flag(job["id"]):
             if blocked_config:
@@ -4730,7 +4802,7 @@ def run_one_job(
                 )
             else:
                 mark_job_run(job["id"], success, error, delivery_error=delivery_error)
-        normalized_deliver = _normalize_deliver_value(job.get("deliver", "local"))
+        normalized_deliver = _normalize_deliver_value(delivery_job.get("deliver", "local"))
         if delivery_error:
             delivery_outcome = "failed"
         elif should_deliver and unresolved_origin:
@@ -4759,9 +4831,59 @@ def run_one_job(
         # anything that isn't a plain Exception.
         _err_text = str(e) or type(e).__name__
         logger.error("Error processing job %s: %s", job['id'], _err_text)
+        _outer_delivery_error = None
+        _outer_delivery_outcome = "suppressed"
+        if isinstance(e, Exception):
+            try:
+                _failure_job = _job_for_run_delivery(
+                    job, False, _load_cron_delivery_config(),
+                )
+                _failure_content = _summarize_cron_failure_for_delivery(
+                    job, _err_text,
+                )
+                _failure_override_unresolved = (
+                    _failure_job is not job
+                    and _normalize_deliver_value(
+                        _failure_job.get("deliver", "local")
+                    ) != "local"
+                    and not _resolve_delivery_targets(_failure_job)
+                )
+                _failure_unresolved_origin = (
+                    _normalize_deliver_value(
+                        _failure_job.get("deliver", "local")
+                    ) == "origin"
+                    and not _resolve_delivery_targets(_failure_job)
+                )
+                if _failure_override_unresolved:
+                    _outer_delivery_error = (
+                        "cron.failure_deliver could not be resolved: "
+                        f"{_failure_job.get('deliver')!r}"
+                    )
+                else:
+                    _outer_delivery_error = _deliver_result(
+                        _failure_job, _failure_content, adapters=adapters, loop=loop,
+                    )
+                _outer_delivery_outcome = (
+                    "failed" if _outer_delivery_error else
+                    "not_configured" if _failure_unresolved_origin else
+                    "suppressed" if _normalize_deliver_value(
+                        _failure_job.get("deliver", "local")
+                    ) == "local" else
+                    "delivered"
+                )
+            except Exception as delivery_exc:
+                _outer_delivery_error = str(delivery_exc)
+                _outer_delivery_outcome = "failed"
+                logger.error(
+                    "Failure delivery also failed for job %s: %s",
+                    job["id"], delivery_exc,
+                )
         try:
             if not _consume_interrupted_flag(job["id"]):
-                mark_job_run(job["id"], False, _err_text)
+                mark_job_run(
+                    job["id"], False, _err_text,
+                    delivery_error=_outer_delivery_error,
+                )
         except Exception as record_err:
             # Never let bookkeeping mask the original interruption.
             logger.error(
@@ -4769,7 +4891,10 @@ def run_one_job(
                 job["id"], record_err,
             )
         try:
-            finish_execution(execution_id, success=False, error=_err_text)
+            finish_execution(
+                execution_id, success=False, error=_err_text,
+                delivery_outcome=_outer_delivery_outcome,
+            )
         except Exception as record_err:
             logger.error(
                 "Failed to finish execution record for job %s: %s",
