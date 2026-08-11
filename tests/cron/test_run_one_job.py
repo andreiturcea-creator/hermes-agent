@@ -14,7 +14,7 @@ import cron.scheduler as s
 
 
 def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final response",
-                    error=None, silent_marker_in=None):
+                    error=None, silent_marker_in=None, cfg=None):
     """Patch the job pipeline primitives and record the call order."""
     calls = []
 
@@ -28,7 +28,7 @@ def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final res
         return f"/tmp/{jid}.txt"
 
     def fake_deliver(job, content, adapters=None, loop=None):
-        calls.append(("deliver", job["id"]))
+        calls.append(("deliver", job["id"], job.get("deliver")))
         return None
 
     def fake_mark(jid, ok, err=None, delivery_error=None, **_kw):
@@ -38,6 +38,7 @@ def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final res
     monkeypatch.setattr(s, "save_job_output", fake_save)
     monkeypatch.setattr(s, "_deliver_result", fake_deliver)
     monkeypatch.setattr(s, "mark_job_run", fake_mark)
+    monkeypatch.setattr(s, "_load_cron_delivery_config", lambda: cfg or {})
     return calls
 
 
@@ -64,6 +65,116 @@ def test_run_one_job_success_sequence(monkeypatch):
     assert ok is True
     assert [c[0] for c in calls] == ["run_job", "save", "deliver", "mark"]
     assert calls[-1] == ("mark", "j2", True)
+
+
+def test_run_one_job_failure_uses_configured_matrix_target(monkeypatch):
+    """A broken Telegram-origin job is delivered only to the Matrix override."""
+    calls = _patch_pipeline(
+        monkeypatch,
+        success=False,
+        final="",
+        error="provider timeout",
+        cfg={"cron": {"failure_deliver": "matrix:!errors:example.org"}},
+    )
+    job = {
+        "id": "broken",
+        "name": "broken report",
+        "deliver": "telegram:1234",
+        "origin": {"platform": "telegram", "chat_id": "1234"},
+    }
+
+    assert s.run_one_job(job) is True
+    deliveries = [call for call in calls if call[0] == "deliver"]
+    assert deliveries == [("deliver", "broken", "matrix:!errors:example.org")]
+    assert job["deliver"] == "telegram:1234"  # stored job view was not mutated
+
+
+def test_run_one_job_success_keeps_original_target(monkeypatch):
+    calls = _patch_pipeline(
+        monkeypatch,
+        success=True,
+        cfg={"cron": {"failure_deliver": "matrix:!errors:example.org"}},
+    )
+    job = {"id": "healthy", "name": "daily report", "deliver": "telegram:1234"}
+
+    assert s.run_one_job(job) is True
+    deliveries = [call for call in calls if call[0] == "deliver"]
+    assert deliveries == [("deliver", "healthy", "telegram:1234")]
+
+
+def test_failure_override_local_suppresses_chat_delivery(monkeypatch):
+    calls = _patch_pipeline(
+        monkeypatch,
+        success=False,
+        final="",
+        error="script failed",
+        cfg={"cron": {"failure_deliver": "local"}},
+    )
+    job = {"id": "quiet-failure", "name": "watchdog", "deliver": "telegram:1234"}
+
+    assert s.run_one_job(job) is True
+    # The normal delivery function still runs so bookkeeping stays unchanged;
+    # ``deliver=local`` resolves to zero platform targets.
+    assert [call for call in calls if call[0] == "deliver"] == [
+        ("deliver", "quiet-failure", "local")
+    ]
+
+
+def test_empty_agent_response_is_routed_as_matrix_failure(monkeypatch):
+    calls = _patch_pipeline(
+        monkeypatch,
+        success=True,
+        final="   \n",
+        cfg={"cron": {"failure_deliver": "matrix:!errors:example.org"}},
+    )
+    job = {"id": "empty", "name": "empty response", "deliver": "telegram:1234"}
+
+    assert s.run_one_job(job) is True
+    assert [call for call in calls if call[0] == "deliver"] == [
+        ("deliver", "empty", "matrix:!errors:example.org")
+    ]
+    assert calls[-1] == ("mark", "empty", False)
+
+
+def test_processing_exception_is_routed_as_matrix_failure(monkeypatch):
+    calls = _patch_pipeline(
+        monkeypatch,
+        cfg={"cron": {"failure_deliver": "matrix:!errors:example.org"}},
+    )
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("executor exploded")
+
+    monkeypatch.setattr(s, "run_job", explode)
+    job = {"id": "exception", "name": "exception path", "deliver": "telegram:1234"}
+
+    assert s.run_one_job(job) is False
+    assert [call for call in calls if call[0] == "deliver"] == [
+        ("deliver", "exception", "matrix:!errors:example.org")
+    ]
+    assert calls[-1] == ("mark", "exception", False)
+
+
+def test_unresolvable_failure_override_never_falls_back(monkeypatch):
+    calls = _patch_pipeline(
+        monkeypatch,
+        success=False,
+        final="",
+        error="broken",
+        cfg={"cron": {"failure_deliver": "not-a-platform"}},
+    )
+    recorded = {}
+
+    def capture_mark(jid, ok, err=None, delivery_error=None):
+        recorded.update(ok=ok, delivery_error=delivery_error)
+
+    monkeypatch.setattr(s, "mark_job_run", capture_mark)
+    job = {"id": "invalid-route", "name": "invalid route", "deliver": "telegram:1234"}
+
+    assert s.run_one_job(job) is True
+    assert [call for call in calls if call[0] == "deliver"] == []
+    assert recorded["ok"] is False
+    assert "could not be resolved" in recorded["delivery_error"]
 
 
 def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path):
@@ -107,5 +218,3 @@ def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path
     assert scope_during_run["base_url"] == "https://openrouter.ai/api/v1"
     # And it was torn down after run_one_job returned (no leak).
     assert ss.current_secret_scope() is None
-
-
