@@ -516,6 +516,23 @@ cron:
 
 Or set the `HERMES_CRON_SCRIPT_TIMEOUT` environment variable. The resolution order is: env var → config.yaml → 3600s default.
 
+## Send failures to a separate room
+
+Cron successes and failures normally share the job's `deliver` target. To keep
+routine reports in their usual chat while sending only broken runs to an
+operations room, configure a failure-only target:
+
+```yaml
+# ~/.hermes/config.yaml
+cron:
+  failure_deliver: "matrix:!errors-room:example.org"
+```
+
+Use `local` to retain failure output without sending it to a chat. Empty or
+omitted preserves the historical behavior. The override never affects
+successful runs and never falls back to the original chat when the configured
+failure target is unavailable.
+
 ## No-agent mode (script-only jobs)
 
 For recurring jobs that don't need LLM reasoning — classic watchdogs, disk/memory alerts, heartbeats, CI pings — pass `no_agent=True` at creation time. The scheduler runs your script on schedule and delivers its stdout directly, skipping the agent entirely:

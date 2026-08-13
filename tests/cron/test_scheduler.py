@@ -1047,17 +1047,17 @@ class TestSilentDelivery:
         deliver_mock.assert_called_once()
 
 
-    def test_whitespace_only_response_is_marked_failed_not_delivered(self):
-        """Whitespace-only final responses should behave like empty responses."""
+    def test_whitespace_only_response_is_marked_failed_and_delivered(self):
+        """Whitespace-only responses become immediate failure alerts."""
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", "   \n\t  ", None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
-             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler._deliver_result", return_value=None) as deliver_mock, \
              patch("cron.scheduler.mark_job_run") as mark_mock:
             from cron.scheduler import tick
             tick(verbose=False)
 
-        deliver_mock.assert_not_called()
+        deliver_mock.assert_called_once()
         mark_mock.assert_called_once_with(
             "monitor-job",
             False,
@@ -2030,4 +2030,3 @@ class TestSetCronSessionTitle:
         out = _set_cron_session_title(db, "sess-1", "Nightly Synthesis")
         assert out == "Nightly Synthesis #2"
         db.get_next_title_in_lineage.assert_called_once_with("Nightly Synthesis")
-
