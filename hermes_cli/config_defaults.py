@@ -2271,6 +2271,13 @@ DEFAULT_CONFIG = {
         # with ONE alert (no re-alert every tick) and NO LLM call is made.
         # Set to false to restore the old behavior (fail during the run).
         "preflight": True,
+        # Route failed cron runs somewhere different from their normal output.
+        # Empty string preserves the historical per-job destination.  Set to
+        # ``local`` for silent local capture or to an explicit platform target
+        # such as ``matrix:!room:example.org`` for a dedicated errors room.
+        # Successes are never affected and an invalid override fails closed:
+        # there is no fallback delivery to the original chat.
+        "failure_deliver": "",
         # Fail closed when an unpinned job's current global model/provider
         # differs from its creation-time snapshot. This prevents unattended
         # jobs from silently inheriting a paid default. Set to false only when
