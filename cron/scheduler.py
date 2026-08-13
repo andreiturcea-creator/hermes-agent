@@ -1677,7 +1677,9 @@ def _load_cron_delivery_config() -> dict:
         from hermes_cli.config import load_config_readonly
 
         loaded = load_config_readonly()
-        return loaded if isinstance(loaded, dict) else {}
+        if not isinstance(loaded, dict):
+            raise TypeError("cron delivery config is not a mapping")
+        return loaded
     except Exception:
         logger.warning("Cron failure-delivery config could not be loaded", exc_info=True)
         # The configured destination is unknowable, so fail closed.  A failed

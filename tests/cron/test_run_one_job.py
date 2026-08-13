@@ -42,6 +42,29 @@ def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final res
     return calls
 
 
+def test_cron_delivery_config_loader_failure_fails_closed(monkeypatch):
+    from hermes_cli import config
+
+    def fail():
+        raise OSError("config unreadable")
+
+    monkeypatch.setattr(config, "load_config_readonly", fail)
+
+    assert s._load_cron_delivery_config() == {
+        "cron": {"failure_deliver": "local"}
+    }
+
+
+def test_cron_delivery_config_non_mapping_fails_closed(monkeypatch):
+    from hermes_cli import config
+
+    monkeypatch.setattr(config, "load_config_readonly", lambda: ["invalid"])
+
+    assert s._load_cron_delivery_config() == {
+        "cron": {"failure_deliver": "local"}
+    }
+
+
 def test_tick_process_job_sequence(monkeypatch):
     """Characterization: a single due job driven through tick() runs the
     sequence run_job → save → deliver → mark, in that order."""
