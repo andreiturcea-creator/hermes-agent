@@ -389,8 +389,39 @@ class MemoryStore:
 
             return True
 
+    def _edge_reference_counts(self, fact_id: int) -> tuple[int, int]:
+        """Return (active, archived) edge counts touching ``fact_id`` as either endpoint."""
+        row = self._conn.execute(
+            """
+            SELECT
+                COALESCE(SUM(status = 'active'), 0)   AS active,
+                COALESCE(SUM(status = 'archived'), 0) AS archived
+            FROM edges
+            WHERE source_fact_id = ? OR target_fact_id = ?
+            """,
+            (fact_id, fact_id),
+        ).fetchone()
+        return int(row["active"]), int(row["archived"])
+
+    @staticmethod
+    def _graph_node_removal_error(fact_id: int, active: int, archived: int) -> ValueError:
+        return ValueError(
+            f"fact_id {fact_id} is a graph node referenced by {active + archived} edge(s) "
+            f"({active} active, {archived} archived). Edges are retained as history and "
+            "are never deleted, so the fact cannot be removed; archive its edges with "
+            "archive_edge() and keep the fact, or correct it with update_fact() instead."
+        )
+
     def remove_fact(self, fact_id: int) -> bool:
-        """Delete a fact and its entity links. Returns True if the row existed."""
+        """Delete a fact and its entity links. Returns True if the row existed.
+
+        A fact that is referenced by any edge (active or archived) is a graph
+        node and is never deleted: ``edges`` carries ``ON DELETE RESTRICT`` and
+        archived edges are history, so the store raises ``ValueError`` with an
+        actionable message instead of a bare ``IntegrityError``. The entity-link
+        and fact deletes run in one savepoint, so a restricted delete can never
+        leave a fact behind with its ``fact_entities`` rows already stripped.
+        """
         with self._lock:
             row = self._conn.execute(
                 "SELECT fact_id, category FROM facts WHERE fact_id = ?", (fact_id,)
@@ -398,10 +429,32 @@ class MemoryStore:
             if row is None:
                 return False
 
-            self._conn.execute(
-                "DELETE FROM fact_entities WHERE fact_id = ?", (fact_id,)
-            )
-            self._conn.execute("DELETE FROM facts WHERE fact_id = ?", (fact_id,))
+            active, archived = self._edge_reference_counts(fact_id)
+            if active or archived:
+                raise self._graph_node_removal_error(fact_id, active, archived)
+
+            # SAVEPOINT works whether or not a transaction is already open on
+            # the shared autocommit connection; RELEASE commits it when it is
+            # the outermost. This keeps the two deletes atomic even if another
+            # process adds an edge between the count above and the delete.
+            self._conn.execute("SAVEPOINT remove_fact")
+            try:
+                self._conn.execute(
+                    "DELETE FROM fact_entities WHERE fact_id = ?", (fact_id,)
+                )
+                self._conn.execute("DELETE FROM facts WHERE fact_id = ?", (fact_id,))
+            except sqlite3.IntegrityError as exc:
+                self._conn.execute("ROLLBACK TO remove_fact")
+                self._conn.execute("RELEASE remove_fact")
+                active, archived = self._edge_reference_counts(fact_id)
+                if active or archived:
+                    raise self._graph_node_removal_error(fact_id, active, archived) from exc
+                raise
+            except BaseException:
+                self._conn.execute("ROLLBACK TO remove_fact")
+                self._conn.execute("RELEASE remove_fact")
+                raise
+            self._conn.execute("RELEASE remove_fact")
             self._conn.commit()
             self._rebuild_bank(row["category"])
             return True
