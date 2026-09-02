@@ -239,6 +239,84 @@ def test_list_subgraph_is_category_induced_and_keeps_isolated_nodes(tmp_path):
         assert limited["truncated"] is True
 
 
+def _entity_link_count(store: MemoryStore, fact_id: int) -> int:
+    return store._conn.execute(
+        "SELECT COUNT(*) FROM fact_entities WHERE fact_id = ?", (fact_id,)
+    ).fetchone()[0]
+
+
+def test_remove_fact_refuses_graph_nodes_and_keeps_them_intact(tmp_path):
+    with MemoryStore(tmp_path / "graph.db") as store:
+        node = store.add_fact("Roll To Squat is a Hybrid Movement", category="exercise")
+        target = store.add_fact("Deep Squat Hold", category="exercise")
+        loner = store.add_fact("Unlinked Fact", category="exercise")
+        edge = store.add_edge(node, target, "progresses_to")
+        links_before = _entity_link_count(store, node)
+        assert links_before > 0
+
+        with pytest.raises(ValueError, match=r"graph node.*1 active, 0 archived"):
+            store.remove_fact(node)
+        # Nothing was partially applied: the fact and its entity links survive.
+        assert store._fact_row(node) is not None
+        assert _entity_link_count(store, node) == links_before
+
+        # Archived edges are history and still pin the node.
+        store.archive_edge(edge["edge_id"], reason="superseded")
+        with pytest.raises(ValueError, match=r"0 active, 1 archived"):
+            store.remove_fact(target)
+        assert store._fact_row(target) is not None
+
+        # Facts outside the graph are still removable.
+        assert store.remove_fact(loner) is True
+        assert store._fact_row(loner) is None
+        assert store.remove_fact(loner) is False
+
+
+def test_remove_fact_is_atomic_when_edge_lands_after_precheck(tmp_path, monkeypatch):
+    with MemoryStore(tmp_path / "graph.db") as store:
+        node = store.add_fact("Roll To Squat is a Hybrid Movement", category="exercise")
+        target = store.add_fact("Deep Squat Hold", category="exercise")
+        store.add_edge(node, target, "progresses_to")
+        links_before = _entity_link_count(store, node)
+        real_counts = store._edge_reference_counts
+        calls = []
+
+        def racing_counts(fact_id):
+            # First call (pre-check) sees no edges, as if another process
+            # inserted the edge right after; later calls see the truth.
+            calls.append(fact_id)
+            return (0, 0) if len(calls) == 1 else real_counts(fact_id)
+
+        monkeypatch.setattr(store, "_edge_reference_counts", racing_counts)
+        with pytest.raises(ValueError, match="graph node"):
+            store.remove_fact(node)
+        assert store._fact_row(node) is not None
+        assert _entity_link_count(store, node) == links_before
+        assert store._conn.in_transaction is False
+        # The connection is healthy after the rollback.
+        assert store.add_fact("After rollback", category="exercise") > 0
+
+
+def test_fact_store_remove_reports_graph_nodes_readably(tmp_path):
+    from plugins.memory.holographic import HolographicMemoryProvider
+
+    db_path = tmp_path / "graph.db"
+    provider = HolographicMemoryProvider(config={"db_path": str(db_path)})
+    provider.initialize("session")
+    try:
+        store = provider._store
+        node = store.add_fact("Base", category="exercise")
+        store.add_edge(node, store.add_fact("Progression", category="exercise"), "progresses_to")
+        result = json.loads(
+            provider.handle_tool_call("fact_store", {"action": "remove", "fact_id": node})
+        )
+        assert "graph node" in result["error"]
+        assert "FOREIGN KEY" not in result["error"]
+        assert store._fact_row(node) is not None
+    finally:
+        provider.shutdown()
+
+
 def test_category_change_rebuilds_source_and_destination_banks(tmp_path, monkeypatch):
     with MemoryStore(tmp_path / "graph.db") as store:
         fact_id = store.add_fact("Category move", category="hybrid_movement")
