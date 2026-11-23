@@ -352,9 +352,9 @@ _CREDENTIAL_FILE_NAMES = (
 # the directory itself, message for a file inside). browser-profile/ is a copy
 # of the user's Cookies / Login Data — the same credential class as auth.json.
 _READ_DENIED_DIRS = (
-    (os.path.join("secrets", "lumen-credentials"),
-     "is the Lumen credential directory and cannot be read directly.",
-     "is inside the Lumen credential directory and cannot be read directly."),
+    ("secrets",
+     "is the Hermes secrets directory and cannot be read directly.",
+     "is inside the Hermes secrets directory and cannot be read directly."),
     ("mcp-tokens",
      "is the Hermes MCP token directory and cannot be read directly.",
      "is a Hermes MCP token file and cannot be read directly."),

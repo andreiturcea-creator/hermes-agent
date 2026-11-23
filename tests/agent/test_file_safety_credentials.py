@@ -285,8 +285,8 @@ def test_profile_mode_blocks_root_credentials(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("profile_name", ["venus", "coder", None])
-def test_lumen_vault_directory_read_denied(tmp_path, monkeypatch, profile_name):
-    """The global credential directory stays private from every profile, including aliases."""
+def test_secrets_directory_read_denied(tmp_path, monkeypatch, profile_name):
+    """Global and profile secrets stay private, including descendants and aliases."""
     import agent.file_safety as fs
 
     root = tmp_path / ".hermes"
@@ -304,21 +304,34 @@ def test_lumen_vault_directory_read_denied(tmp_path, monkeypatch, profile_name):
     file_alias.symlink_to(password)
     assert fs._hermes_home_path() == profile
     assert fs._hermes_root_path() == root
-    for path in (vault, password, backup, nested, alias, alias / backup.name, file_alias):
+    protected = [vault, password, backup, nested, alias, alias / backup.name, file_alias]
+    for home in {root, profile}:
+        secret = _create(home, "secrets/other-service/key.txt")
+        secret_alias = tmp_path / ("global-alias" if home == root else "profile-alias")
+        secret_alias.symlink_to(secret.parent.parent, target_is_directory=True)
+        protected.extend((
+            home / "secrets", secret, home / "secrets/future-service/future-backup",
+            _create(home, "secrets/vault-backups/snapshot.bak"),
+            secret_alias, secret_alias / "other-service/key.txt",
+        ))
+        for benign in ("BOOTSTRAP.md", "control.txt", "secrets-public/notes.txt"):
+            assert fs.get_read_block_error(str(_create(home, benign))) is None
+    for path in protected:
         error = fs.get_read_block_error(str(path))
-        assert error and "Lumen credential" in error
+        assert error and "Hermes secrets" in error
     assert fs.get_read_block_error(str(root / ".env"))
     assert fs.get_read_block_error(str(_create(root, "notes.txt"))) is None
-    assert fs.get_read_block_error(str(_create(root, "secrets/lumen-credentials-public/notes.txt"))) is None
+    assert fs.get_read_block_error(str(_create(root, "secrets/lumen-credentials-public/notes.txt")))
 
 
-def test_read_file_refuses_lumen_vault_before_content_backend(tmp_path, monkeypatch):
+@pytest.mark.parametrize("profile_name", ["venus", "coder", None])
+def test_read_file_refuses_secrets_before_content_backend(tmp_path, monkeypatch, profile_name):
     """Exercise the actual file tool without allowing content access or extraction."""
     import json
     import tools.file_tools as ft
 
     root = tmp_path / ".hermes"
-    profile = root / "profiles" / "venus"
+    profile = root / "profiles" / profile_name if profile_name else root
     profile.mkdir(parents=True)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(profile))
@@ -336,7 +349,9 @@ def test_read_file_refuses_lumen_vault_before_content_backend(tmp_path, monkeypa
 
     monkeypatch.setattr(ft, "_get_file_ops", lambda task_id="default": NoContentBackend())
     monkeypatch.setattr(ft, "_read_extracted_document", no_extraction)
-    for path in (password.parent, password, backup, alias, root / ".env"):
+    other_secret = _create(profile, "secrets/other-service.bin")
+    for path in (root / "secrets", password.parent, password, backup, alias,
+                 other_secret, other_secret.parent, root / ".env"):
         result = json.loads(ft.read_file_tool(str(path)))
         assert "Access denied:" in result.get("error", "")
 
@@ -364,7 +379,10 @@ def test_lumen_vault_case_alias_refused_before_content(tmp_path, monkeypatch):
             raise AssertionError("case alias reached content backend")
 
     monkeypatch.setattr(ft, "_get_file_ops", lambda task_id="default": NoContentBackend())
-    for path in (alias.parent, alias, alias.parent / "missing-future-backup.csv"):
+    other_secret = _create(root, "secrets/other-service.bin")
+    other_alias = root / "SECRETS" / other_secret.name
+    for path in (alias.parent, alias, alias.parent / "missing-future-backup.csv",
+                 root / "SECRETS", other_alias):
         assert fs.get_read_block_error(str(path))
         result = json.loads(ft.read_file_tool(str(path)))
         assert "Access denied:" in result.get("error", "")
