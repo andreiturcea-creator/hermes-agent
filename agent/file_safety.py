@@ -352,6 +352,9 @@ _CREDENTIAL_FILE_NAMES = (
 # the directory itself, message for a file inside). browser-profile/ is a copy
 # of the user's Cookies / Login Data — the same credential class as auth.json.
 _READ_DENIED_DIRS = (
+    (os.path.join("secrets", "lumen-credentials"),
+     "is the Lumen credential directory and cannot be read directly.",
+     "is inside the Lumen credential directory and cannot be read directly."),
     ("mcp-tokens",
      "is the Hermes MCP token directory and cannot be read directly.",
      "is a Hermes MCP token file and cannot be read directly."),
@@ -401,7 +404,15 @@ def get_read_block_error(path: str) -> Optional[str]:
     else:
         for subdir, dir_msg, file_msg in _READ_DENIED_DIRS:
             for blocked_dir in _resolve_each(hd / subdir for hd in hermes_dirs):
-                if _is_under(resolved, blocked_dir):
+                contained = _is_under(resolved, blocked_dir)
+                # resolve() preserves case aliases on case-insensitive filesystems.
+                if not contained:
+                    for ancestor in (resolved, *resolved.parents):
+                        with suppress(OSError):
+                            if ancestor.samefile(blocked_dir):
+                                contained = True
+                                break
+                if contained:
                     reason = (dir_msg if resolved == blocked_dir else file_msg) + _DID_SUFFIX
                     break
             if reason:

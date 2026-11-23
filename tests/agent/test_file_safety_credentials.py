@@ -282,3 +282,89 @@ def test_profile_mode_blocks_root_credentials(tmp_path, monkeypatch):
     root_tok.parent.mkdir(parents=True, exist_ok=True)
     root_tok.write_text("x")
     assert "MCP token" in (get_read_block_error(str(root_tok)) or "")
+
+
+@pytest.mark.parametrize("profile_name", ["venus", "coder", None])
+def test_lumen_vault_directory_read_denied(tmp_path, monkeypatch, profile_name):
+    """The global credential directory stays private from every profile, including aliases."""
+    import agent.file_safety as fs
+
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / profile_name if profile_name else root
+    profile.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    vault = root / "secrets" / "lumen-credentials"
+    password = _create(root, "secrets/lumen-credentials/Passwords.csv")
+    backup = _create(root, "secrets/lumen-credentials/Passwords.csv.bak-before-rotation")
+    nested = _create(root, "secrets/lumen-credentials/nested/arbitrary.txt")
+    alias = tmp_path / "vault-alias"
+    alias.symlink_to(vault, target_is_directory=True)
+    file_alias = tmp_path / "password-alias.txt"
+    file_alias.symlink_to(password)
+    assert fs._hermes_home_path() == profile
+    assert fs._hermes_root_path() == root
+    for path in (vault, password, backup, nested, alias, alias / backup.name, file_alias):
+        error = fs.get_read_block_error(str(path))
+        assert error and "Lumen credential" in error
+    assert fs.get_read_block_error(str(root / ".env"))
+    assert fs.get_read_block_error(str(_create(root, "notes.txt"))) is None
+    assert fs.get_read_block_error(str(_create(root, "secrets/lumen-credentials-public/notes.txt"))) is None
+
+
+def test_read_file_refuses_lumen_vault_before_content_backend(tmp_path, monkeypatch):
+    """Exercise the actual file tool without allowing content access or extraction."""
+    import json
+    import tools.file_tools as ft
+
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "venus"
+    profile.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    password = _create(root, "secrets/lumen-credentials/Passwords.csv")
+    backup = _create(root, "secrets/lumen-credentials/Passwords.csv.bak-before-rotation")
+    alias = tmp_path / "alias.csv"
+    alias.symlink_to(password)
+
+    class NoContentBackend:
+        def read_file(self, *args, **kwargs):
+            raise AssertionError("denied content reached backend")
+
+    def no_extraction(*args, **kwargs):
+        raise AssertionError("denied content reached extractor")
+
+    monkeypatch.setattr(ft, "_get_file_ops", lambda task_id="default": NoContentBackend())
+    monkeypatch.setattr(ft, "_read_extracted_document", no_extraction)
+    for path in (password.parent, password, backup, alias, root / ".env"):
+        result = json.loads(ft.read_file_tool(str(path)))
+        assert "Access denied:" in result.get("error", "")
+
+
+@pytest.mark.platforms("macos")
+def test_lumen_vault_case_alias_refused_before_content(tmp_path, monkeypatch):
+    """Native case-insensitive volumes must not expose a directory through another spelling."""
+    import json
+    import agent.file_safety as fs
+    import tools.file_tools as ft
+
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "venus"
+    profile.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    password = _create(root, "secrets/lumen-credentials/Passwords.csv")
+    alias = root / "SECRETS" / "LUMEN-CREDENTIALS" / "Passwords.csv"
+    if not alias.exists():
+        pytest.skip("temporary volume is case-sensitive")
+    assert alias.samefile(password)
+
+    class NoContentBackend:
+        def read_file(self, *args, **kwargs):
+            raise AssertionError("case alias reached content backend")
+
+    monkeypatch.setattr(ft, "_get_file_ops", lambda task_id="default": NoContentBackend())
+    for path in (alias.parent, alias, alias.parent / "missing-future-backup.csv"):
+        assert fs.get_read_block_error(str(path))
+        result = json.loads(ft.read_file_tool(str(path)))
+        assert "Access denied:" in result.get("error", "")
